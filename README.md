@@ -34,7 +34,11 @@ Anthropic's Messages API, that translation is its job, not submux's.
 
 ## Build
 
-Go 1.27+, standard library only, no external modules:
+Go 1.27+. The relay itself (`serve`, `routes`, `check`, `models`, `status`)
+is standard library only, no external modules, and nothing below reaches
+its hot path. `submux pick` (the interactive setup picker, see below) pulls
+in `github.com/charmbracelet/bubbletea`, `bubbles`, and `lipgloss` for its
+TUI -- deliberately, once, for that one command only:
 
 ```sh
 go build -o /usr/local/bin/submux .
@@ -115,6 +119,12 @@ Default config path: `~/.config/submux/config.json` (override with
   it with NO upstream lookup; this is the only way to answer for a
   `passthrough` route, since only the caller holds that OAuth and submux has
   no catalogue to query.
+- `models` (optional, per route, only meaningful alongside `subscription`) —
+  a fixed list of model ids for `submux pick`'s create wizard to offer for
+  that subscription, since a `passthrough` route's own upstream can't be
+  listed (same reason as above). A `subscription` route with no `models`
+  shows up in the wizard as a single explanatory, unselectable line instead
+  of an empty list.
 - `subscriptions` (optional, top-level) — a map from an upstream
   `/v1/models` `owned_by` value to a human subscription name, used by any
   route with no fixed `subscription` label. An `owned_by` with no entry here
@@ -192,6 +202,24 @@ falls back to its own default for that tier. The launcher unsets
 this tool depends on), starts `submux serve` if nothing is already
 listening on the configured port, exports `ANTHROPIC_BASE_URL` and the four
 tier env vars, and execs `claude`.
+
+### Interactive picker: no flags
+
+Run `bin/submux-claude` with **no** `--fable`/`--opus`/`--sonnet`/`--haiku`
+flags and it launches `submux pick` instead of requiring you to type ids: a
+full-screen picker (rendered to `/dev/tty`, never stdout) offering your
+saved setups sorted most-used-first, or a "create a new setup" wizard where
+every step is a pick-a-subscription-then-pick-a-model list -- no id typing
+anywhere. A script that already passes explicit tier flags is completely
+unaffected; that path is untouched.
+
+Saved setups live in `~/.config/submux/profiles.json`; a live model-list
+cache (ids and their `owned_by` label only, no credential) lives in
+`~/.config/submux/models-cache.json`, refreshed after 10 minutes. Both
+degrade gracefully if missing or corrupt -- you start with an empty history
+rather than a crash. Run `submux pick --out <file>` directly to inspect the
+`SUBMUX_MAIN`/`SUBMUX_FABLE`/`SUBMUX_OPUS`/`SUBMUX_SONNET`/`SUBMUX_HAIKU`/
+`SUBMUX_PROFILE` lines it writes.
 
 ## Caveats
 

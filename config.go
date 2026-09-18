@@ -52,6 +52,13 @@ type rawRoute struct {
 	// the caller holds that OAuth, so submux cannot list Anthropic's
 	// catalogue and must not try (see subs.go).
 	Subscription string `json:"subscription,omitempty"`
+	// Models is an OPTIONAL fixed id list for a route that also carries
+	// Subscription (the claude-* passthrough route, whose upstream
+	// /v1/models submux cannot call -- only the caller holds that OAuth,
+	// spec §2.4). Ignored on a route with no Subscription: such a route's
+	// model list always comes from a live upstream lookup (subs.go,
+	// modelscache.go).
+	Models []string `json:"models,omitempty"`
 }
 
 // rawSubscriptionOverride is one entry of the on-disk "subscription_overrides"
@@ -171,6 +178,7 @@ func loadConfig(path string) (*config, error) {
 			modelRewrite: rr.ModelRewrite,
 			fallback:     rr.Fallback,
 			subscription: rr.Subscription,
+			models:       rr.Models,
 		}
 
 		kind, source, err := parseAuth(rr.Auth)

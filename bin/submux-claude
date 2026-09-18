@@ -16,6 +16,17 @@ FABLE_ID=""
 OPUS_ID=""
 SONNET_ID=""
 HAIKU_ID=""
+MAIN_ID=""
+
+# No tier flags at all means the flags-typing path is skipped entirely in
+# favor of the interactive picker (`submux pick`, spec §2.7): recorded
+# BEFORE the flag loop below, since that loop consumes $@.
+PICK_IF_NO_FLAGS=1
+for arg in "$@"; do
+  case "$arg" in
+    --fable|--opus|--sonnet|--haiku) PICK_IF_NO_FLAGS=0 ;;
+  esac
+done
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,6 +39,28 @@ while [ $# -gt 0 ]; do
     *) echo "submux-claude: unknown argument: $1" >&2; exit 64 ;;
   esac
 done
+
+# The interactive picker: only when none of --fable/--opus/--sonnet/--haiku
+# was passed. Explicit-flags callers (scripts) get byte-for-byte today's
+# behaviour below, untouched.
+if [ "$PICK_IF_NO_FLAGS" -eq 1 ]; then
+  if ! command -v submux >/dev/null 2>&1; then
+    echo "submux-claude: no 'submux' binary on PATH; build it with 'go build -o /path/on/PATH/submux .' first" >&2
+    exit 1
+  fi
+  PICK_OUT="$(mktemp)"
+  trap 'rm -f "$PICK_OUT"' EXIT INT TERM
+  if ! submux pick --out "$PICK_OUT"; then
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$PICK_OUT"
+  MAIN_ID="${SUBMUX_MAIN:-}"
+  FABLE_ID="${SUBMUX_FABLE:-}"
+  OPUS_ID="${SUBMUX_OPUS:-}"
+  SONNET_ID="${SUBMUX_SONNET:-}"
+  HAIKU_ID="${SUBMUX_HAIKU:-}"
+fi
 
 # Step 1: the OAuth bearer this whole tool depends on only appears when
 # BOTH of these are unset (see README "Mechanism"); either one suppresses
@@ -82,4 +115,7 @@ if [ -n "$HAIKU_ID" ]; then
 fi
 
 # Step 5
+if [ -n "$MAIN_ID" ]; then
+  exec claude --model "$MAIN_ID" "$@"
+fi
 exec claude "$@"

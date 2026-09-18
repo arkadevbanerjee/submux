@@ -73,6 +73,12 @@ type route struct {
 	// the whole route (§2.1 in the subs spec). Empty means "look it up from
 	// the upstream's /v1/models owned_by field instead" (subs.go).
 	subscription string
+
+	// models is the optional fixed id list for a route carrying
+	// subscription (config.go rawRoute.Models). Empty means "no model list
+	// configured for this subscription" (subs.go/modelscache.go render that
+	// as an explanatory, unselectable line rather than an error).
+	models []string
 }
 
 // fallbackChain resolves the chain of model ids this route falls back to,

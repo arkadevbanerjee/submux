@@ -31,6 +31,8 @@ func main() {
 		cmdModels(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
+	case "pick":
+		cmdPick(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -46,7 +48,8 @@ func usage() {
   submux routes [--config PATH]
   submux check <model-id> [--config PATH]
   submux models [--config PATH]
-  submux status [--config PATH] [--listen ADDR]`)
+  submux status [--config PATH] [--listen ADDR]
+  submux pick [--config PATH] --out PATH`)
 }
 
 func resolveConfigPath(flagVal string) (string, error) {
