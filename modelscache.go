@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // modelsCacheFreshFor is how long a cache entry is used without a refresh
@@ -77,6 +79,12 @@ type subscriptionOption struct {
 	ModelIDs    []string
 	Unavailable string // non-empty => shown but not selectable
 	CacheAge    string // "" (fresh/no cache yet) or "cached 3h ago"
+
+	// Upstreams is the set of route upstream base URLs whose /v1/models
+	// feeds this option (empty for a fixed-label route, which has nothing
+	// to fetch -- only the caller holds that OAuth). Non-empty is what
+	// makes a row refreshable via the 'r' key (DEFECT 1, round 2).
+	Upstreams []string
 }
 
 // buildSubscriptionCatalog assembles every selectable subscription across
@@ -104,6 +112,7 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 			existing.ModelIDs = opt.ModelIDs
 			existing.Unavailable = ""
 		}
+		existing.Upstreams = mergeSortedUnique(existing.Upstreams, opt.Upstreams)
 	}
 
 	for _, rt := range cfg.Routes {
@@ -123,7 +132,7 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 
 		models, cacheAge, err := modelsForRoute(cfg, rt, entries, now)
 		if err != nil {
-			add(subscriptionOption{Name: routeUnavailableName(rt), Unavailable: err.Error()})
+			add(subscriptionOption{Name: routeUnavailableName(rt), Unavailable: err.Error(), Upstreams: []string{rt.upstream}})
 			continue
 		}
 		byGroup := map[string][]string{}
@@ -139,7 +148,7 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 		for _, n := range names {
 			ids := byGroup[n]
 			sort.Strings(ids)
-			add(subscriptionOption{Name: n, ModelIDs: ids, CacheAge: cacheAge})
+			add(subscriptionOption{Name: n, ModelIDs: ids, CacheAge: cacheAge, Upstreams: []string{rt.upstream}})
 		}
 	}
 
@@ -201,6 +210,93 @@ func fetchAndConvert(rt route) ([]cachedModel, error) {
 		out = append(out, cachedModel{ID: m.ID, OwnedBy: m.OwnedBy})
 	}
 	return out, nil
+}
+
+// refreshResultMsg is what refreshSubscriptionCmd sends back to Update once
+// every upstream backing one subscription option has been re-fetched
+// (DEFECT 1, round 2: the 'r' key). subName lets the caller re-locate the
+// row after a catalog rebuild even if sort order shifted.
+type refreshResultMsg struct {
+	subName         string
+	upstreams       map[string]cacheEntry // upstream -> freshly fetched entry, success only
+	failedUpstreams []string
+	firstErr        error
+}
+
+// refreshSubscriptionCmd re-fetches every upstream in upstreams directly,
+// bypassing modelsForRoute's 10-minute freshness window on purpose -- this
+// is the explicit manual refresh the spec carves out as the ONLY way to
+// force a re-fetch (staleness alone never fires one). It runs off the UI
+// goroutine; failures leave entries untouched so the caller can keep
+// serving the stale data (spec: "never blank the list").
+func refreshSubscriptionCmd(cfg *config, subName string, upstreams []string) tea.Cmd {
+	return func() tea.Msg {
+		result := refreshResultMsg{subName: subName, upstreams: map[string]cacheEntry{}}
+		for _, up := range upstreams {
+			rt, ok := findRouteByUpstream(cfg, up)
+			if !ok {
+				result.failedUpstreams = append(result.failedUpstreams, up)
+				if result.firstErr == nil {
+					result.firstErr = fmt.Errorf("no route configured for %s", up)
+				}
+				continue
+			}
+			fresh, err := fetchAndConvert(rt)
+			if err != nil {
+				result.failedUpstreams = append(result.failedUpstreams, up)
+				if result.firstErr == nil {
+					result.firstErr = err
+				}
+				continue
+			}
+			result.upstreams[up] = cacheEntry{FetchedAt: time.Now(), Models: fresh}
+		}
+		return result
+	}
+}
+
+// findRouteByUpstream locates the (non-fixed-label) route serving upstream,
+// so refreshSubscriptionCmd can resolve its credential. Fixed-label routes
+// are never returned: they have nothing to fetch.
+func findRouteByUpstream(cfg *config, upstream string) (route, bool) {
+	for _, rt := range cfg.Routes {
+		if rt.subscription == "" && rt.upstream == upstream {
+			return rt, true
+		}
+	}
+	return route{}, false
+}
+
+// payerForModelID answers "who pays for this id" (DEFECT 2, round 2: the
+// history screen's expanded row) by reusing subscriptionNameForOwnedBy
+// against the ALREADY-LOADED cached catalogue -- entries came from
+// loadModelsCache/ensureCatalog, never a fresh network call per keystroke.
+// A fixed-label route's configured "models" list resolves directly (its
+// subscription name IS the payer, no owned_by involved). Returns "" if id
+// is not found in any route's config or any cached upstream entry.
+func payerForModelID(cfg *config, entries map[string]cacheEntry, id string) string {
+	if id == "" {
+		return ""
+	}
+	for _, rt := range cfg.Routes {
+		if rt.subscription == "" {
+			continue
+		}
+		for _, m := range rt.models {
+			if m == id {
+				return rt.subscription
+			}
+		}
+	}
+	for _, entry := range entries {
+		for _, m := range entry.Models {
+			if m.ID == id {
+				name, _ := subscriptionNameForOwnedBy(cfg, id, m.OwnedBy)
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 func mergeSortedUnique(a, b []string) []string {

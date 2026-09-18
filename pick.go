@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -180,6 +181,11 @@ type pickModel struct {
 	cacheEntries map[string]cacheEntry
 	catalogWarn  string
 
+	spin          spinner.Model
+	refreshing    bool   // a manual 'r' refresh (DEFECT 1, round 2) is in flight
+	refreshTarget string // subscription Name being refreshed
+	refreshErr    string // last refresh failure, surfaced in the status bar until the next refresh
+
 	wizStep     int
 	wizPicks    [5]string
 	subCursor   int
@@ -201,6 +207,7 @@ func newPickModel(cfg *config, pPath, cPath, outPath string, profiles []Profile,
 	mf.Placeholder = "filter models"
 	ni := textinput.New()
 	ni.Placeholder = "setup name"
+	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 
 	m := pickModel{
 		cfg:          cfg,
@@ -214,6 +221,7 @@ func newPickModel(cfg *config, pPath, cPath, outPath string, profiles []Profile,
 		nameInput:    ni,
 		deleteTarget: -1,
 		now:          time.Now(),
+		spin:         sp,
 	}
 	if len(profiles) == 0 {
 		// Empty history jumps straight into the wizard (§2.2).
@@ -267,8 +275,54 @@ func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case spinner.TickMsg:
+		if !m.refreshing {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		return m, cmd
+	case refreshResultMsg:
+		return m.applyRefreshResult(msg), nil
 	}
 	return m, nil
+}
+
+// applyRefreshResult merges a completed 'r'-triggered refresh (DEFECT 1,
+// round 2) back into the model: successes update the disk cache and rebuild
+// the catalog so the row's age clears; failures are surfaced in the status
+// bar without touching m.cacheEntries, so the stale data already on screen
+// is never blanked.
+func (m pickModel) applyRefreshResult(msg refreshResultMsg) pickModel {
+	m.refreshing = false
+	if m.cacheEntries == nil {
+		m.cacheEntries = map[string]cacheEntry{}
+	}
+	for up, entry := range msg.upstreams {
+		m.cacheEntries[up] = entry
+	}
+	if len(msg.upstreams) > 0 {
+		if err := saveModelsCache(m.cachePath, m.cacheEntries); err != nil {
+			m.catalogWarn = fmt.Sprintf("could not write models cache: %v", err)
+		}
+		m.catalog = buildSubscriptionCatalog(m.cfg, m.cacheEntries, time.Now())
+	}
+	if len(msg.failedUpstreams) > 0 {
+		errText := "refresh failed"
+		if msg.firstErr != nil {
+			errText = msg.firstErr.Error()
+		}
+		m.refreshErr = fmt.Sprintf("refresh of %s failed (%s) -- showing cached data", msg.subName, errText)
+	} else {
+		m.refreshErr = ""
+	}
+	for i, opt := range m.catalog {
+		if opt.Name == msg.subName {
+			m.subCursor = i
+			break
+		}
+	}
+	return m
 }
 
 func (m pickModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -404,6 +458,22 @@ func (m pickModel) updateWizSub(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.wizPicks[m.wizStep] = ""
 		return m.advanceWizStep()
+	case "r":
+		// DEFECT 1, round 2: bypass the 10-minute freshness window and
+		// re-fetch this row's upstream(s) right now. No-op on a fixed-label
+		// route (Upstreams empty -- only the caller holds that OAuth) and
+		// while a refresh is already in flight.
+		if m.refreshing || m.subCursor >= len(m.catalog) {
+			return m, nil
+		}
+		opt := m.catalog[m.subCursor]
+		if len(opt.Upstreams) == 0 {
+			return m, nil
+		}
+		m.refreshing = true
+		m.refreshTarget = opt.Name
+		m.refreshErr = ""
+		return m, tea.Batch(m.spin.Tick, refreshSubscriptionCmd(m.cfg, opt.Name, opt.Upstreams))
 	case "esc":
 		if m.wizStep > 0 {
 			m.mode = modeWizModel
@@ -649,7 +719,14 @@ func (m pickModel) statusBar() string {
 			model = m.wizPicks[m.wizStep]
 		}
 	}
-	return fmt.Sprintf("Mode: %s  Model: %s", mode, model)
+	base := fmt.Sprintf("Mode: %s  Model: %s", mode, model)
+	if m.refreshing {
+		return base + "  " + m.spin.View() + " refreshing " + m.refreshTarget + "…"
+	}
+	if m.refreshErr != "" {
+		return base + "  ! " + m.refreshErr
+	}
+	return base
 }
 
 func (m pickModel) viewHistory() string {
@@ -665,7 +742,7 @@ func (m pickModel) viewHistory() string {
 		line := fmt.Sprintf("%-24s  %3d use(s)  %s", p.Name, p.Uses, relativeTime(p.LastUsed, m.now))
 		if i == m.cursor {
 			fmt.Fprintln(&b, styleSel.Render("> "+line))
-			fmt.Fprintln(&b, styleDim.Render("    main="+orDash(p.Main)+"  fable="+orDash(p.Fable)+"  opus="+orDash(p.Opus)+"  sonnet="+orDash(p.Sonnet)+"  haiku="+orDash(p.Haiku)))
+			b.WriteString(m.renderExpandedRow(p))
 			if m.deleteTarget == i {
 				fmt.Fprintln(&b, styleWarn.Render("    press d again to delete, any other key cancels"))
 			}
@@ -691,6 +768,56 @@ func orDash(s string) string {
 	return s
 }
 
+// renderExpandedRow answers spec §2.2 "each with the subscription that pays
+// for it" (DEFECT 2, round 2): one line per tier, id and payer in their own
+// aligned columns instead of one cramped `key=id` line with no payer at
+// all. An unset tier renders dim, distinct from a resolved-but-unknown
+// payer. Column widths are computed from the actual ids/labels, never
+// hardcoded (ids vary a lot in length).
+func (m pickModel) renderExpandedRow(p Profile) string {
+	type slot struct{ key, id string }
+	slots := []slot{
+		{"main", p.Main}, {"fable", p.Fable}, {"opus", p.Opus},
+		{"sonnet", p.Sonnet}, {"haiku", p.Haiku},
+	}
+	labelW, idW := 0, 0
+	for _, s := range slots {
+		if len(s.key) > labelW {
+			labelW = len(s.key)
+		}
+		if s.id != "" && len(s.id) > idW {
+			idW = len(s.id)
+		}
+	}
+	var b strings.Builder
+	for _, s := range slots {
+		if s.id == "" {
+			fmt.Fprintf(&b, "    %-*s  %s\n", labelW, s.key, styleDim.Render("—  (session default)"))
+			continue
+		}
+		payer := m.paidBy(s.id)
+		if payer == "" {
+			payer = styleDim.Render("(unresolved)")
+		}
+		fmt.Fprintf(&b, "    %-*s  %-*s  %s\n", labelW, s.key, idW, s.id, payer)
+	}
+	return b.String()
+}
+
+// paidBy resolves who pays for model id against the ALREADY-cached
+// catalogue only -- it never fires a network call (spec: "NOT a fresh
+// network call per keystroke"). If the wizard's catalog is already loaded
+// in memory it reuses that; otherwise it falls back to a plain read of the
+// on-disk models cache (no fetch, no write), which is stale-tolerant by
+// design (spec §2.5).
+func (m pickModel) paidBy(id string) string {
+	entries := m.cacheEntries
+	if entries == nil {
+		entries = loadModelsCache(m.cachePath)
+	}
+	return payerForModelID(m.cfg, entries, id)
+}
+
 func (m pickModel) viewWizSub() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "step %d/%d -- pick a subscription for %s\n\n", m.wizStep+1, len(tierKeys), tierLabels[m.wizStep])
@@ -701,8 +828,14 @@ func (m pickModel) viewWizSub() string {
 		label := fmt.Sprintf("%-28s  %d id(s)", opt.Name, len(opt.ModelIDs))
 		if opt.Unavailable != "" {
 			label = opt.Name + "  " + styleUnavail.Render("("+opt.Unavailable+")")
+			if len(opt.Upstreams) > 0 {
+				label += styleDim.Render(" · r to retry")
+			}
 		} else if opt.CacheAge != "" {
 			label += styleDim.Render("  models cached " + opt.CacheAge + " · r to refresh")
+		}
+		if m.refreshing && opt.Name == m.refreshTarget {
+			label += "  " + m.spin.View() + styleDim.Render("refreshing…")
 		}
 		if i == m.subCursor {
 			fmt.Fprintln(&b, styleSel.Render("> "+label))
@@ -710,7 +843,7 @@ func (m pickModel) viewWizSub() string {
 			fmt.Fprintln(&b, "  "+label)
 		}
 	}
-	fmt.Fprintln(&b, styleDim.Render("↑↓/jk move · enter choose · s skip tier · esc back · q quit"))
+	fmt.Fprintln(&b, styleDim.Render("↑↓/jk move · enter choose · s skip tier · r refresh · esc back · q quit"))
 	return b.String()
 }
 
