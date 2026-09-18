@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -409,5 +410,34 @@ func TestModelBearingRequestUnaffected(t *testing.T) {
 	passCapture.snapshot(t)
 	if starCapture.receivedRequest() {
 		t.Errorf("a model-bearing request was diverted to the no_model_route override; it must route on its own model id, unaffected")
+	}
+}
+
+// TestLogLinePathPresent: a 404 (or any status) is otherwise untraceable to
+// the endpoint that produced it, since the log line named everything except
+// the request path. The per-request log line must carry the path, including
+// the query string, so an operator can grep straight to the offending
+// endpoint.
+func TestLogLinePathPresent(t *testing.T) {
+	_, srv := newCaptureServer(t)
+	routes := []route{
+		{match: "claude-*", upstream: srv.URL, upstreamURL: mustParseURL(t, srv.URL), authKind: "passthrough"},
+	}
+	cfg := &config{Listen: "127.0.0.1:0", MaxBodyBytes: defaultMaxBodyBytes, Routes: routes}
+	s := newServer(cfg, false)
+
+	var logBuf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(orig)
+
+	body := []byte(`{"model":"claude-fable-5-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	line := logBuf.String()
+	if !strings.Contains(line, `path="/v1/messages?beta=true"`) {
+		t.Errorf("log line = %q, want it to contain path=\"/v1/messages?beta=true\"", line)
 	}
 }

@@ -152,8 +152,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if noModel {
 		modelField = fmt.Sprintf("%q (no-model -> %s)", bm.Model, rt.match)
 	}
-	log.Printf("model=%s match=%q upstream=%s auth=%s status=%d bytes=%d duration=%s agent=%v",
-		modelField, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent)
+	log.Printf("model=%s match=%q upstream=%s auth=%s status=%d bytes=%d duration=%s agent=%v path=%q",
+		modelField, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent, r.URL.RequestURI())
 }
 
 // readBodyLimited reads up to limit+1 bytes; if that read produced more
