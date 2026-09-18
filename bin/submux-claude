@@ -1,0 +1,85 @@
+#!/bin/sh
+# submux-claude — launch Claude Code through a local submux relay so its
+# four subagent tiers can each be pinned to a different id.
+#
+#   submux-claude --fable <id> --opus <id> --sonnet <id> --haiku <id> \
+#                  [--port N] [-- <claude args>]
+#
+# Every --fable/--opus/--sonnet/--haiku flag is optional: an omitted tier is
+# left unset so Claude Code falls back to its own default for that tier.
+# The four ids are never hardcoded here or in the Go binary; they are chosen
+# at launch time only.
+set -eu
+
+PORT=8787
+FABLE_ID=""
+OPUS_ID=""
+SONNET_ID=""
+HAIKU_ID=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fable) FABLE_ID="$2"; shift 2 ;;
+    --opus) OPUS_ID="$2"; shift 2 ;;
+    --sonnet) SONNET_ID="$2"; shift 2 ;;
+    --haiku) HAIKU_ID="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) echo "submux-claude: unknown argument: $1" >&2; exit 64 ;;
+  esac
+done
+
+# Step 1: the OAuth bearer this whole tool depends on only appears when
+# BOTH of these are unset (see README "Mechanism"); either one suppresses
+# it silently, so unset both and say so if we changed anything.
+if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  echo "submux-claude: unsetting ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN: either one suppresses the CLI's own subscription OAuth bearer that passthrough routing depends on" >&2
+fi
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
+
+# Step 2: start submux serve if nothing is already listening on $PORT.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/submux"
+LOG_FILE="$STATE_DIR/submux.log"
+mkdir -p "$STATE_DIR"
+
+if ! nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; then
+  if ! command -v submux >/dev/null 2>&1; then
+    echo "submux-claude: no 'submux' binary on PATH; build it with 'go build -o /path/on/PATH/submux .' first" >&2
+    exit 1
+  fi
+  nohup submux serve --listen "127.0.0.1:$PORT" >>"$LOG_FILE" 2>&1 &
+
+  waited=0
+  until nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; do
+    if [ "$waited" -ge 3000 ]; then
+      echo "submux-claude: submux serve did not come up on port $PORT within 3s; see $LOG_FILE" >&2
+      exit 1
+    fi
+    sleep 0.1
+    waited=$((waited + 100))
+  done
+fi
+
+# Step 3
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+
+# Step 4: only export a tier's vars if an id was actually given for it.
+if [ -n "$FABLE_ID" ]; then
+  export ANTHROPIC_DEFAULT_FABLE_MODEL="$FABLE_ID"
+  export ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="$FABLE_ID"
+fi
+if [ -n "$OPUS_ID" ]; then
+  export ANTHROPIC_DEFAULT_OPUS_MODEL="$OPUS_ID"
+  export ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="$OPUS_ID"
+fi
+if [ -n "$SONNET_ID" ]; then
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$SONNET_ID"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="$SONNET_ID"
+fi
+if [ -n "$HAIKU_ID" ]; then
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL="$HAIKU_ID"
+  export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$HAIKU_ID"
+fi
+
+# Step 5
+exec claude "$@"
