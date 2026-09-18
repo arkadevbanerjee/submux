@@ -68,6 +68,11 @@ type route struct {
 	// fall back". See rawRoute.Fallback in config.go for why this must not
 	// collapse to a plain []string.
 	fallback *[]string
+
+	// subscription is a FIXED "which subscription pays for this" label for
+	// the whole route (§2.1 in the subs spec). Empty means "look it up from
+	// the upstream's /v1/models owned_by field instead" (subs.go).
+	subscription string
 }
 
 // fallbackChain resolves the chain of model ids this route falls back to,
@@ -93,7 +98,13 @@ func matchRoute(routes []route, modelID string) (route, bool) {
 }
 
 // describeRoute renders a one-line human summary, used by `submux routes`
-// and `submux check`. Never includes the resolved credential value.
+// and `submux check`. Never includes the resolved credential value. A route
+// with a fixed subscription label (§2.6) appends subscription="<name>"; this
+// stays an OFFLINE string format, no network call.
 func describeRoute(r route) string {
-	return fmt.Sprintf("match=%q upstream=%s auth=%s", r.match, r.upstream, r.auth)
+	s := fmt.Sprintf("match=%q upstream=%s auth=%s", r.match, r.upstream, r.auth)
+	if r.subscription != "" {
+		s += fmt.Sprintf(" subscription=%q", r.subscription)
+	}
+	return s
 }

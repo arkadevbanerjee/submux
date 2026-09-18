@@ -9,17 +9,26 @@
       "match": "claude-fable-*",
       "upstream": "https://api.anthropic.com",
       "auth": "passthrough",
-      "fallback": ["claude-opus-5", "gpt-5.6-luna", "glm-5.3"]
+      "fallback": ["claude-opus-5", "gpt-5.6-luna", "glm-5.3"],
+      "subscription": "Claude Max (this CLI's own login)"
     },
     {
       "match": "claude-*",
       "upstream": "https://api.anthropic.com",
-      "auth": "passthrough"
+      "auth": "passthrough",
+      "subscription": "Claude Max (this CLI's own login)"
     },
     {
       "match": "*",
       "upstream": "http://127.0.0.1:8317",
       "auth": "bearer:keychain:local-aggregator/API_TOKEN"
     }
+  ],
+  "subscriptions": {
+    "xai": "SuperGrok",
+    "openai": "ChatGPT (Codex)"
+  },
+  "subscription_overrides": [
+    {"match": "glm-*", "subscription": "GLM Coding Plan"}
   ]
 }

@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 )
 
 func main() {
@@ -25,6 +27,8 @@ func main() {
 		cmdRoutes(os.Args[2:])
 	case "check":
 		cmdCheck(os.Args[2:])
+	case "models":
+		cmdModels(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "-h", "--help", "help":
@@ -41,6 +45,7 @@ func usage() {
   submux serve [--config PATH] [--listen ADDR] [--debug-headers]
   submux routes [--config PATH]
   submux check <model-id> [--config PATH]
+  submux models [--config PATH]
   submux status [--config PATH] [--listen ADDR]`)
 }
 
@@ -150,7 +155,86 @@ func cmdCheck(args []string) {
 		fmt.Fprintf(os.Stderr, "submux check %q: no route matched\n", modelID)
 		os.Exit(1)
 	}
-	fmt.Printf("model=%q -> %s\n", modelID, describeRoute(rt))
+
+	fmt.Printf("model=%q\n", modelID)
+	fmt.Printf("  route        %s\n", describeRoute(rt))
+
+	res := resolveSubscription(cfg, rt, modelID)
+	switch res.Status {
+	case "fixed", "resolved":
+		fmt.Printf("  subscription %s\n", res.Name)
+		fmt.Printf("  evidence     %s\n", res.Evidence)
+	case "not_served":
+		fmt.Printf("  subscription NOT SERVED by %s\n", rt.upstream)
+		if len(res.Suggestions) > 0 {
+			fmt.Printf("  nearest      %s\n", strings.Join(res.Suggestions, ", "))
+		}
+		os.Exit(1)
+	case "unknown":
+		fmt.Printf("  subscription UNKNOWN: %v\n", res.Err)
+		os.Exit(2)
+	}
+}
+
+// cmdModels implements `submux models` (§2.5): fetch every non-fixed-label
+// route's /v1/models once, group ids by resolved subscription, print
+// "SUBSCRIPTION (n ids): id, id, id ..." sorted by count desc. A route that
+// carries a fixed subscription label is skipped -- it has no catalogue to
+// list (the claude-* passthrough route, for example). A route whose
+// credential or upstream fails is reported to stderr and skipped, so one
+// broken aggregator does not blank the whole command.
+func cmdModels(args []string) {
+	fs := flag.NewFlagSet("models", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to config.json")
+	_ = fs.Parse(args)
+
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		log.Fatalf("submux: %v", err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		log.Fatalf("submux: %v", err)
+	}
+
+	buckets := map[string][]string{}
+	for _, rt := range cfg.Routes {
+		if rt.subscription != "" {
+			continue
+		}
+		if err := resolveRouteCredential(&rt); err != nil {
+			fmt.Fprintf(os.Stderr, "submux models: route match=%q: %v\n", rt.match, err)
+			continue
+		}
+		models, err := fetchUpstreamModels(rt)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "submux models: route match=%q: %v\n", rt.match, err)
+			continue
+		}
+		for _, m := range models {
+			name, _ := subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
+			buckets[name] = append(buckets[name], m.ID)
+		}
+	}
+
+	type row struct {
+		name string
+		ids  []string
+	}
+	rows := make([]row, 0, len(buckets))
+	for name, ids := range buckets {
+		sort.Strings(ids)
+		rows = append(rows, row{name, ids})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if len(rows[i].ids) != len(rows[j].ids) {
+			return len(rows[i].ids) > len(rows[j].ids)
+		}
+		return rows[i].name < rows[j].name
+	})
+	for _, r := range rows {
+		fmt.Printf("%s (%d ids): %s\n", r.name, len(r.ids), strings.Join(r.ids, ", "))
+	}
 }
 
 // cmdStatus queries a running `submux serve` process's admin endpoint and

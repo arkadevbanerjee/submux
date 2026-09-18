@@ -110,6 +110,21 @@ Default config path: `~/.config/submux/config.json` (override with
   a model id that just triggered a fallback status is skipped entirely on
   later requests, unless the upstream's own `Retry-After` says otherwise.
   Cooldowns are in-memory only and reset on restart.
+- `subscription` (optional, per route) — a FIXED "which subscription pays
+  for this" label for the whole route. `submux check`/`submux models` print
+  it with NO upstream lookup; this is the only way to answer for a
+  `passthrough` route, since only the caller holds that OAuth and submux has
+  no catalogue to query.
+- `subscriptions` (optional, top-level) — a map from an upstream
+  `/v1/models` `owned_by` value to a human subscription name, used by any
+  route with no fixed `subscription` label. An `owned_by` with no entry here
+  prints raw, tagged `(unmapped)`, rather than being silently guessed at.
+- `subscription_overrides` (optional, top-level) — an ordered list of
+  `{"match": "<model glob>", "subscription": "<name>"}`, checked BEFORE
+  `subscriptions`. Exists because some aggregators' `owned_by` names the
+  wire protocol, not the payer (e.g. reporting `"anthropic"` for a model
+  actually billed to a different coding plan) — the override corrects that
+  without waiting on the aggregator to fix its own label.
 - `no_model_route` (optional, top-level) — the route a request with no
   `"model"` field (or a non-JSON body) is sent to, instead of falling
   through to ordinary glob matching on an empty model id. These are
@@ -140,9 +155,24 @@ spliced with a second model's output.
 ```sh
 submux serve [--config PATH] [--listen ADDR] [--debug-headers]
 submux routes [--config PATH]           # print the resolved route table
-submux check <model-id> [--config PATH] # which route/upstream an id would take
+submux check <model-id> [--config PATH] # route, upstream and PAYING subscription for an id
+submux models [--config PATH]           # every servable id, grouped by paying subscription
 submux status [--config PATH] [--listen ADDR] # cooling ids + last 20 fallbacks
 ```
+
+`submux check <model-id>` answers "which subscription actually pays for
+this" (§2 above), not just which route matches: for a route with no fixed
+`subscription` label it makes ONE upstream `/v1/models` call to look up the
+id's real `owned_by`, applies `subscription_overrides` then `subscriptions`,
+and prints the raw `owned_by` alongside the mapped name so a wrong mapping
+can never hide. An id absent from that upstream's catalogue prints
+`NOT SERVED` plus up to 5 near-miss suggestions and exits 1 (catch a typo'd
+id before a session launches on it); an unreachable upstream or missing
+credential prints `UNKNOWN` and exits 2.
+
+`submux models` fetches every non-fixed-label route's catalogue once and
+groups ids by resolved subscription, answering "what can I use today" in
+one line per subscription.
 
 `submux status` queries a running `submux serve` process's admin endpoint
 (fallback state lives in that process's memory only, never on disk), and

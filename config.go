@@ -28,6 +28,11 @@ type rawConfig struct {
 	CooldownDefaultSeconds int        `json:"cooldown_default_seconds,omitempty"`
 	NoModelRoute           string     `json:"no_model_route,omitempty"`
 	Routes                 []rawRoute `json:"routes"`
+	// Subscriptions and SubscriptionOverrides are both OPTIONAL: a config
+	// naming neither loads and behaves exactly as it did before "which
+	// subscription pays for this" existed. See subs.go.
+	Subscriptions         map[string]string         `json:"subscriptions,omitempty"`
+	SubscriptionOverrides []rawSubscriptionOverride `json:"subscription_overrides,omitempty"`
 }
 
 type rawRoute struct {
@@ -41,6 +46,21 @@ type rawRoute struct {
 	// len(x) == 0 check on a plain []string would collapse both cases and
 	// silently disable an owner's explicit opt-out (§9.1).
 	Fallback *[]string `json:"fallback,omitempty"`
+	// Subscription (optional) is a FIXED label for the whole route: no
+	// upstream /v1/models lookup is ever made for it. This is how the
+	// claude-* passthrough route answers "which subscription" -- nobody but
+	// the caller holds that OAuth, so submux cannot list Anthropic's
+	// catalogue and must not try (see subs.go).
+	Subscription string `json:"subscription,omitempty"`
+}
+
+// rawSubscriptionOverride is one entry of the on-disk "subscription_overrides"
+// list: a glob over model ids, evaluated in order, BEFORE the owned_by map,
+// so a known-lying owned_by value (e.g. glm-5.3 reporting "anthropic") can be
+// corrected without waiting on the aggregator to fix its own label.
+type rawSubscriptionOverride struct {
+	Match        string `json:"match"`
+	Subscription string `json:"subscription"`
 }
 
 // config is the resolved, validated form the server actually runs on.
@@ -51,6 +71,14 @@ type config struct {
 	FallbackStatusCodes []int
 	CooldownDefault     time.Duration
 	Routes              []route
+
+	// Subscriptions maps an upstream /v1/models "owned_by" value to a
+	// human subscription name (§2.1). Nil/empty is valid: `submux check`
+	// then prints the raw owned_by value with an "(unmapped)" marker
+	// instead of silently guessing.
+	Subscriptions map[string]string
+	// SubscriptionOverrides is evaluated, in order, BEFORE Subscriptions.
+	SubscriptionOverrides []subscriptionOverride
 
 	// NoModelRoute is the route a request with no "model" field (or a
 	// non-JSON body) is sent to, resolved once at load time. nil means no
@@ -105,6 +133,17 @@ func loadConfig(path string) (*config, error) {
 		cfg.CooldownDefault = defaultCooldown
 	}
 
+	cfg.Subscriptions = raw.Subscriptions
+	for i, ov := range raw.SubscriptionOverrides {
+		if ov.Match == "" {
+			return nil, fmt.Errorf("config %s: subscription_overrides[%d]: match must not be empty", path, i)
+		}
+		if ov.Subscription == "" {
+			return nil, fmt.Errorf("config %s: subscription_overrides[%d] (match=%q): subscription must not be empty", path, i, ov.Match)
+		}
+		cfg.SubscriptionOverrides = append(cfg.SubscriptionOverrides, subscriptionOverride{match: ov.Match, subscription: ov.Subscription})
+	}
+
 	if len(raw.Routes) == 0 {
 		return nil, fmt.Errorf("config %s: routes must not be empty", path)
 	}
@@ -131,6 +170,7 @@ func loadConfig(path string) (*config, error) {
 			auth:         rr.Auth,
 			modelRewrite: rr.ModelRewrite,
 			fallback:     rr.Fallback,
+			subscription: rr.Subscription,
 		}
 
 		kind, source, err := parseAuth(rr.Auth)
@@ -216,19 +256,32 @@ func parseAuth(auth string) (kind, source string, err error) {
 // a silent 401 on the first proxied request.
 func resolveCredentials(cfg *config) error {
 	for i := range cfg.Routes {
-		r := &cfg.Routes[i]
-		switch r.authKind {
-		case "passthrough", "none":
-			continue
-		case "bearer", "x-api-key":
-			val, err := resolveCredentialValue(r.authSource)
-			if err != nil {
-				return fmt.Errorf("routes[%d] (match=%q, auth=%q): %w", i, r.match, r.auth, err)
-			}
-			r.authValue = val
+		if err := resolveRouteCredential(&cfg.Routes[i]); err != nil {
+			return fmt.Errorf("routes[%d] (match=%q): %w", i, cfg.Routes[i].match, err)
 		}
 	}
 	return nil
+}
+
+// resolveRouteCredential populates r.authValue in place for a single route
+// (a no-op for "passthrough"/"none"). Factored out of resolveCredentials so
+// `submux check` and `submux models` (subs.go) can resolve just the ONE
+// route a command needs, on demand, without paying for every other route's
+// keychain lookup or env read.
+func resolveRouteCredential(r *route) error {
+	switch r.authKind {
+	case "passthrough", "none":
+		return nil
+	case "bearer", "x-api-key":
+		val, err := resolveCredentialValue(r.authSource)
+		if err != nil {
+			return fmt.Errorf("auth=%q: %w", r.auth, err)
+		}
+		r.authValue = val
+		return nil
+	default:
+		return nil
+	}
 }
 
 // resolveCredentialValue fetches the secret named by an authSource string
