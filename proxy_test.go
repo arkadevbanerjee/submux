@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +41,15 @@ func (c *captured) snapshot(t *testing.T) (http.Header, []byte) {
 		t.Fatal("upstream never received a request")
 	}
 	return c.header, c.body
+}
+
+// receivedRequest reports whether this upstream ever received a request,
+// without failing the test -- used where the assertion is "this upstream
+// must NOT have been hit" as well as "must have been hit".
+func (c *captured) receivedRequest() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.got
 }
 
 func newCaptureServer(t *testing.T) (*captured, *httptest.Server) {
@@ -247,4 +258,156 @@ func TestStreamingFlushes(t *testing.T) {
 	}
 
 	close(release)
+}
+
+// mustLoadConfig writes configJSON to a temp file and loads it through the
+// real loadConfig path, so these tests exercise the actual no_model_route
+// resolution and validation logic, not a hand-assembled config struct.
+func mustLoadConfig(t *testing.T, configJSON string) *config {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig: unexpected error: %v", err)
+	}
+	return cfg
+}
+
+// TestNoModelRoutesToPassthroughByDefault: with no "no_model_route" key, a
+// model-less body must reach the first passthrough route in order, even
+// though the "*" route (which would otherwise catch it) is NOT passthrough.
+func TestNoModelRoutesToPassthroughByDefault(t *testing.T) {
+	passCapture, passSrv := newCaptureServer(t)
+	starCapture, starSrv := newCaptureServer(t)
+
+	cfg := mustLoadConfig(t, fmt.Sprintf(`{
+		"listen": "127.0.0.1:0",
+		"routes": [
+			{"match": "claude-*", "upstream": %q, "auth": "passthrough"},
+			{"match": "*", "upstream": %q, "auth": "none"}
+		]
+	}`, passSrv.URL, starSrv.URL))
+
+	s := newServer(cfg, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	passCapture.snapshot(t)
+	if starCapture.receivedRequest() {
+		t.Errorf("the non-passthrough \"*\" route received the no-model request; it should have gone to the default passthrough route instead")
+	}
+}
+
+// TestNoModelRouteExplicit: an explicit "no_model_route" overrides the
+// passthrough default.
+func TestNoModelRouteExplicit(t *testing.T) {
+	passCapture, passSrv := newCaptureServer(t)
+	starCapture, starSrv := newCaptureServer(t)
+
+	cfg := mustLoadConfig(t, fmt.Sprintf(`{
+		"listen": "127.0.0.1:0",
+		"no_model_route": "*",
+		"routes": [
+			{"match": "claude-*", "upstream": %q, "auth": "passthrough"},
+			{"match": "*", "upstream": %q, "auth": "none"}
+		]
+	}`, passSrv.URL, starSrv.URL))
+
+	s := newServer(cfg, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	starCapture.snapshot(t)
+	if passCapture.receivedRequest() {
+		t.Errorf("the passthrough route received the no-model request; the explicit no_model_route=\"*\" should have won")
+	}
+}
+
+// TestNoModelRouteUnknownValueIsStartupError: a "no_model_route" value that
+// matches no configured route's "match" fails config load, naming the bad
+// value and listing the available route matches.
+func TestNoModelRouteUnknownValueIsStartupError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	badConfig := `{
+		"listen": "127.0.0.1:0",
+		"no_model_route": "does-not-exist-*",
+		"routes": [
+			{"match": "claude-*", "upstream": "http://127.0.0.1:1", "auth": "passthrough"},
+			{"match": "*", "upstream": "http://127.0.0.1:2", "auth": "none"}
+		]
+	}`
+	if err := os.WriteFile(path, []byte(badConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("loadConfig: expected an error for an unknown no_model_route value, got nil")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist-*") {
+		t.Errorf("loadConfig error = %q, want it to name the bad value %q", err.Error(), "does-not-exist-*")
+	}
+	if !strings.Contains(err.Error(), "available route matches") || !strings.Contains(err.Error(), "claude-*") {
+		t.Errorf("loadConfig error = %q, want it to list the available route matches", err.Error())
+	}
+}
+
+// TestNoModelNoPassthroughRouteFallsBack: with no "no_model_route" key AND
+// no passthrough route at all, a model-less request keeps today's
+// behaviour and lands on the "*" fallback route.
+func TestNoModelNoPassthroughRouteFallsBack(t *testing.T) {
+	claudeCapture, claudeSrv := newCaptureServer(t)
+	starCapture, starSrv := newCaptureServer(t)
+
+	cfg := mustLoadConfig(t, fmt.Sprintf(`{
+		"listen": "127.0.0.1:0",
+		"routes": [
+			{"match": "claude-*", "upstream": %q, "auth": "none"},
+			{"match": "*", "upstream": %q, "auth": "none"}
+		]
+	}`, claudeSrv.URL, starSrv.URL))
+
+	s := newServer(cfg, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	starCapture.snapshot(t)
+	if claudeCapture.receivedRequest() {
+		t.Errorf("a non-passthrough, non-\"*\" route received the no-model request; with zero passthrough routes it should have fallen back to \"*\"")
+	}
+}
+
+// TestModelBearingRequestUnaffected: a normal request that DOES carry a
+// model field must route exactly as before, regardless of any
+// no_model_route override in effect.
+func TestModelBearingRequestUnaffected(t *testing.T) {
+	passCapture, passSrv := newCaptureServer(t)
+	starCapture, starSrv := newCaptureServer(t)
+
+	cfg := mustLoadConfig(t, fmt.Sprintf(`{
+		"listen": "127.0.0.1:0",
+		"no_model_route": "*",
+		"routes": [
+			{"match": "claude-*", "upstream": %q, "auth": "passthrough"},
+			{"match": "*", "upstream": %q, "auth": "none"}
+		]
+	}`, passSrv.URL, starSrv.URL))
+
+	s := newServer(cfg, false)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"claude-fable-5-1"}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	passCapture.snapshot(t)
+	if starCapture.receivedRequest() {
+		t.Errorf("a model-bearing request was diverted to the no_model_route override; it must route on its own model id, unaffected")
+	}
 }

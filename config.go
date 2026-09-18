@@ -26,6 +26,7 @@ type rawConfig struct {
 	DefaultFallback        []string   `json:"default_fallback,omitempty"`
 	FallbackStatusCodes    []int      `json:"fallback_status_codes,omitempty"`
 	CooldownDefaultSeconds int        `json:"cooldown_default_seconds,omitempty"`
+	NoModelRoute           string     `json:"no_model_route,omitempty"`
 	Routes                 []rawRoute `json:"routes"`
 }
 
@@ -50,6 +51,13 @@ type config struct {
 	FallbackStatusCodes []int
 	CooldownDefault     time.Duration
 	Routes              []route
+
+	// NoModelRoute is the route a request with no "model" field (or a
+	// non-JSON body) is sent to, resolved once at load time. nil means no
+	// override applies: such requests fall through to the ordinary
+	// matchRoute(routes, "") lookup, i.e. today's behaviour (the "*" route,
+	// if one is configured).
+	NoModelRoute *route
 }
 
 // defaultConfigPath returns ~/.config/submux/config.json for the current user.
@@ -133,6 +141,32 @@ func loadConfig(path string) (*config, error) {
 		r.authSource = source
 
 		cfg.Routes = append(cfg.Routes, r)
+	}
+
+	// §no_model_route: resolve once, after every route is built, so pointers
+	// into cfg.Routes are stable (no further appends follow).
+	if raw.NoModelRoute != "" {
+		var matches []string
+		for i := range cfg.Routes {
+			matches = append(matches, cfg.Routes[i].match)
+			if cfg.Routes[i].match == raw.NoModelRoute {
+				cfg.NoModelRoute = &cfg.Routes[i]
+				break
+			}
+		}
+		if cfg.NoModelRoute == nil {
+			return nil, fmt.Errorf("config %s: no_model_route %q matches no configured route; available route matches: %v", path, raw.NoModelRoute, matches)
+		}
+	} else {
+		for i := range cfg.Routes {
+			if cfg.Routes[i].authKind == "passthrough" {
+				cfg.NoModelRoute = &cfg.Routes[i]
+				break
+			}
+		}
+		// No passthrough route at all: cfg.NoModelRoute stays nil, and a
+		// model-less request falls through to matchRoute(routes, ""), which
+		// is exactly today's behaviour (the "*" route, if configured).
 	}
 
 	return cfg, nil

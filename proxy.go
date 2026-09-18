@@ -92,8 +92,19 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// to the "*" route rather than erroring (§4).
 	var bm bodyModelOnly
 	_ = json.Unmarshal(buf, &bm) // best-effort; leaves bm.Model == "" on any failure
+	noModel := bm.Model == ""
 
-	rt, matched := matchRoute(s.cfg.Routes, bm.Model)
+	var rt route
+	var matched bool
+	if noModel && s.cfg.NoModelRoute != nil {
+		// no_model_route: a model-less request (an Anthropic control call,
+		// not a completion) is routed here instead of the ordinary glob
+		// match, so it never lands on an aggregator that has no idea what
+		// it is. A request WITH a model field never takes this branch.
+		rt, matched = *s.cfg.NoModelRoute, true
+	} else {
+		rt, matched = matchRoute(s.cfg.Routes, bm.Model)
+	}
 	if !matched {
 		writeAnthropicError(w, http.StatusBadGateway, "invalid_request_error", "submux: no route matched and no \"*\" fallback is configured")
 		return
@@ -137,8 +148,12 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.proxy.ServeHTTP(rec, r)
 	}
 
-	log.Printf("model=%q match=%q upstream=%s auth=%s status=%d bytes=%d duration=%s agent=%v",
-		bm.Model, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent)
+	modelField := fmt.Sprintf("%q", bm.Model)
+	if noModel {
+		modelField = fmt.Sprintf("%q (no-model -> %s)", bm.Model, rt.match)
+	}
+	log.Printf("model=%s match=%q upstream=%s auth=%s status=%d bytes=%d duration=%s agent=%v",
+		modelField, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent)
 }
 
 // readBodyLimited reads up to limit+1 bytes; if that read produced more

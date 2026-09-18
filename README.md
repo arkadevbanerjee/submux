@@ -110,6 +110,18 @@ Default config path: `~/.config/submux/config.json` (override with
   a model id that just triggered a fallback status is skipped entirely on
   later requests, unless the upstream's own `Retry-After` says otherwise.
   Cooldowns are in-memory only and reset on restart.
+- `no_model_route` (optional, top-level) — the route a request with no
+  `"model"` field (or a non-JSON body) is sent to, instead of falling
+  through to ordinary glob matching on an empty model id. These are
+  Anthropic control calls the CLI makes on its own, not completions, so
+  routing them onto a non-Anthropic aggregator's fallback route just gets a
+  404. The value must equal the `match` of exactly one configured route, or
+  config load fails naming the bad value and listing the available route
+  matches. **Absent** means "use the first route in order whose `auth` is
+  `passthrough`"; if no route is `passthrough` at all, it keeps today's
+  behaviour and uses the `"*"` fallback route. A request that DOES carry a
+  `model` field is never affected by this key. Such requests log as
+  `model="" (no-model -> <matched glob>)` so the reason is visible.
 
 ### Fallback visibility
 
