@@ -154,23 +154,30 @@ func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 }
 
 // nearestIDs returns up to limit ids from ids that look like a typo of
-// query: ids with query as a prefix first, then ids merely containing query,
-// each group sorted for stable output. Plain substring/prefix on purpose
+// query, ranked in three tiers (each sorted for stable output): (1) id has
+// query as a prefix, (2) query has id as a prefix -- the commonest typo
+// shape, an operator ADDING characters onto a real id ("grok-4.60" for
+// "grok-4.6", "claude-opus-55" for "claude-opus-5"), which is never a
+// substring of anything and so is invisible to a one-directional check, (3)
+// either string contains the other. Plain substring/prefix on purpose
 // (§2.4) -- this exists to catch an operator's typo before a session
 // launches on it, not to do fuzzy ranking.
 func nearestIDs(query string, ids []string, limit int) []string {
-	var prefix, substr []string
+	var exactPrefix, queryPrefix, substr []string
 	for _, id := range ids {
 		switch {
 		case strings.HasPrefix(id, query):
-			prefix = append(prefix, id)
-		case strings.Contains(id, query):
+			exactPrefix = append(exactPrefix, id)
+		case strings.HasPrefix(query, id):
+			queryPrefix = append(queryPrefix, id)
+		case strings.Contains(id, query) || strings.Contains(query, id):
 			substr = append(substr, id)
 		}
 	}
-	sort.Strings(prefix)
+	sort.Strings(exactPrefix)
+	sort.Strings(queryPrefix)
 	sort.Strings(substr)
-	out := append(prefix, substr...)
+	out := append(append(exactPrefix, queryPrefix...), substr...)
 	if len(out) > limit {
 		out = out[:limit]
 	}

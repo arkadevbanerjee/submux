@@ -117,6 +117,24 @@ func TestResolveSubscriptionNotServed(t *testing.T) {
 	if len(res.Suggestions) == 0 {
 		t.Fatalf("resolveSubscription: expected non-empty suggestions for a near-miss id, got none")
 	}
+
+	// The commonest typo shape: the operator ADDED characters onto a real
+	// id ("grok-4.60" for "grok-4.6"). That query is never a substring of
+	// anything, so a one-directional prefix/contains check misses it
+	// entirely (ROUND=2 bug report).
+	added := resolveSubscription(cfg, rt, "grok-4.60")
+	if added.Status != "not_served" {
+		t.Fatalf("resolveSubscription status = %q, want not_served", added.Status)
+	}
+	found := false
+	for _, s := range added.Suggestions {
+		if s == "grok-4.6" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("resolveSubscription(%q).Suggestions = %v, want \"grok-4.6\" among them", "grok-4.60", added.Suggestions)
+	}
 }
 
 // Test 6: an upstream 500 and an unreachable upstream both come back
