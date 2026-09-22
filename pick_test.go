@@ -125,6 +125,10 @@ func TestRefreshKeyTriggersUpstreamRefetch(t *testing.T) {
 	}
 	m := newPickModel(cfg, "/tmp/does-not-matter-profiles.json", "/tmp/does-not-matter-cache.json", "", nil, "")
 	m.mode = modeWizSub
+	// This test exercises the MODELS 'r' refresh; suppress the §S8 background
+	// burn refresh so the drain loop below does not fire real provider
+	// fetches and ccusage alongside it.
+	m.burnRefreshChecked = true
 	m.cacheEntries = entries
 	m.catalog = buildSubscriptionCatalog(cfg, entries, time.Now())
 	m.subCursor = 0

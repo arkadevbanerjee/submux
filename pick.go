@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -119,11 +120,12 @@ func runPlainPicker(cfg *config, pPath string, profiles []Profile, outPath strin
 // profile's name (empty for an ad-hoc, unsaved launch).
 type picks struct {
 	Main, Fable, Opus, Sonnet, Haiku string
+	Effort                           string
 	ProfileName                      string
 }
 
 func picksFromProfile(p Profile) picks {
-	return picks{Main: p.Main, Fable: p.Fable, Opus: p.Opus, Sonnet: p.Sonnet, Haiku: p.Haiku, ProfileName: p.Name}
+	return picks{Main: p.Main, Fable: p.Fable, Opus: p.Opus, Sonnet: p.Sonnet, Haiku: p.Haiku, Effort: p.Effort, ProfileName: p.Name}
 }
 
 // writeOutFile writes exactly the §2.6 key names, only for slots that are
@@ -141,6 +143,7 @@ func writeOutFile(path string, p picks) error {
 	writeIfSet("SUBMUX_OPUS", p.Opus)
 	writeIfSet("SUBMUX_SONNET", p.Sonnet)
 	writeIfSet("SUBMUX_HAIKU", p.Haiku)
+	writeIfSet("SUBMUX_EFFORT", p.Effort)
 	writeIfSet("SUBMUX_PROFILE", p.ProfileName)
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
@@ -159,8 +162,11 @@ const (
 	modeHistory pickMode = iota
 	modeWizSub
 	modeWizModel
+	modeWizEffort
 	modeWizName
 )
+
+var effortOptions = [6]string{"", "low", "medium", "high", "xhigh", "max"}
 
 type pickModel struct {
 	cfg          *config
@@ -181,17 +187,23 @@ type pickModel struct {
 	cacheEntries map[string]cacheEntry
 	catalogWarn  string
 
+	burn               burnFile // loaded from disk by ensureCatalog, merged by burnRefreshMsg (§S8)
+	burnRefreshChecked bool     // ONE background burn refresh per picker session, never blocking
+	burnRefreshErr     string   // last burn refresh failure, surfaced in the status bar
+
 	spin          spinner.Model
 	refreshing    bool   // a manual 'r' refresh (DEFECT 1, round 2) is in flight
 	refreshTarget string // subscription Name being refreshed
 	refreshErr    string // last refresh failure, surfaced in the status bar until the next refresh
 
-	wizStep     int
-	wizPicks    [5]string
-	subCursor   int
-	modelCursor int
-	modelFilter textinput.Model
-	nameInput   textinput.Model
+	wizStep      int
+	wizPicks     [5]string
+	effortCursor int
+	wizEffort    string
+	subCursor    int
+	modelCursor  int
+	modelFilter  textinput.Model
+	nameInput    textinput.Model
 
 	width, height int
 	now           time.Time
@@ -256,16 +268,45 @@ func (m pickModel) visibleProfiles() []Profile {
 	return out
 }
 
-func (m *pickModel) ensureCatalog() {
-	if m.catalog != nil {
-		return
+// ensureCatalog lazily builds the subscription catalog and loads the burn
+// cache (§S8). Both loads are disk-only: no network, no blocking -- a stale
+// or missing burn.json still renders (missing rows show not-disclosed). When
+// either half of the burn cache is past its freshness window it returns ONE
+// background refresh cmd (once per picker session); the caller must hand it
+// back to the runtime, mirroring how the 'r' refresh dispatches.
+func (m *pickModel) ensureCatalog() tea.Cmd {
+	var cmd tea.Cmd
+	if m.catalog == nil {
+		entries := loadModelsCache(m.cachePath)
+		m.catalog = buildSubscriptionCatalog(m.cfg, entries, m.now)
+		m.cacheEntries = entries
+		if err := saveModelsCache(m.cachePath, entries); err != nil {
+			m.catalogWarn = fmt.Sprintf("could not write models cache: %v", err)
+		}
 	}
-	entries := loadModelsCache(m.cachePath)
-	m.catalog = buildSubscriptionCatalog(m.cfg, entries, m.now)
-	m.cacheEntries = entries
-	if err := saveModelsCache(m.cachePath, entries); err != nil {
-		m.catalogWarn = fmt.Sprintf("could not write models cache: %v", err)
+	if m.burn.Providers == nil {
+		if p, err := burnPath(); err == nil {
+			m.burn = loadBurnFile(p)
+		}
 	}
+	if !m.burnRefreshChecked {
+		m.burnRefreshChecked = true
+		providers, measured := m.burnNeedsRefresh()
+		if providers || measured {
+			cmd = refreshBurnCmd(m.cfg, m.cacheEntries, m.burn, providers, measured)
+		}
+	}
+	return cmd
+}
+
+// burnNeedsRefresh reports which halves of the burn cache are past their
+// freshness window (7d provider, 24h measured, §S8). A cold file counts as
+// stale: the very first picker session populates it in the background.
+func (m pickModel) burnNeedsRefresh() (providers, measured bool) {
+	now := time.Now()
+	providers = m.burn.ProviderFetchedAt.IsZero() || now.Sub(m.burn.ProviderFetchedAt) > burnProviderFreshFor
+	measured = m.burn.MeasuredFetchedAt.IsZero() || now.Sub(m.burn.MeasuredFetchedAt) > burnMeasuredFreshFor
+	return providers, measured
 }
 
 func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -284,6 +325,13 @@ func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case refreshResultMsg:
 		return m.applyRefreshResult(msg), nil
+	case burnRefreshMsg:
+		// §S8: msg.burn always started from the previous file, so even a
+		// failed refresh keeps the stale data already on screen; the error
+		// is surfaced in the status bar until the next refresh.
+		m.burn = msg.burn
+		m.burnRefreshErr = msg.err
+		return m, nil
 	}
 	return m, nil
 }
@@ -337,10 +385,16 @@ func (m pickModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modeHistory:
 		return m.updateHistory(msg)
 	case modeWizSub:
-		m.ensureCatalog()
-		return m.updateWizSub(msg)
+		burnCmd := m.ensureCatalog()
+		next, cmd := m.updateWizSub(msg)
+		if burnCmd != nil {
+			return next, tea.Batch(burnCmd, cmd)
+		}
+		return next, cmd
 	case modeWizModel:
 		return m.updateWizModel(msg)
+	case modeWizEffort:
+		return m.updateWizEffort(msg)
 	case modeWizName:
 		return m.updateWizName(msg)
 	}
@@ -399,15 +453,14 @@ func (m pickModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filtering = true
 		m.filterInput.Focus()
 	case "n":
-		m.startWizard()
+		return m, m.startWizard()
 	case "d":
 		if m.cursor < len(rows) {
 			m.deleteTarget = m.cursor
 		}
 	case "enter":
 		if m.cursor == newSetupIdx || len(rows) == 0 {
-			m.startWizard()
-			return m, nil
+			return m, m.startWizard()
 		}
 		chosen := rows[m.cursor]
 		m.profiles = touchProfile(m.profiles, chosen.Name, m.now)
@@ -422,14 +475,14 @@ func (m pickModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *pickModel) startWizard() {
+func (m *pickModel) startWizard() tea.Cmd {
 	m.mode = modeWizSub
 	m.wizStep = 0
 	m.wizPicks = [5]string{}
 	m.subCursor = 0
 	m.modelCursor = 0
 	m.modelFilter.SetValue("")
-	m.ensureCatalog()
+	return m.ensureCatalog()
 }
 
 func removeProfileByName(profiles []Profile, name string) []Profile {
@@ -548,13 +601,11 @@ func (m pickModel) updateWizModel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // advanceWizStep moves to the next tier's subscription pane, or into the
-// name prompt once haiku (the last tier) is set.
+// effort prompt once haiku (the last tier) is set.
 func (m pickModel) advanceWizStep() (tea.Model, tea.Cmd) {
 	if m.wizStep >= len(tierKeys)-1 {
-		m.mode = modeWizName
-		m.nameInput.SetValue(autoName(m.wizPicks))
-		m.nameInput.Focus()
-		m.nameInput.CursorEnd()
+		m.mode = modeWizEffort
+		m.effortCursor = 0
 		return m, nil
 	}
 	m.wizStep++
@@ -566,11 +617,38 @@ func (m pickModel) advanceWizStep() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m pickModel) updateWizEffort(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q":
+		m.quitting = true
+		return m, tea.Quit
+	case "esc":
+		m.mode = modeWizModel
+		m.wizStep = len(tierKeys) - 1
+		return m, nil
+	case "up", "ctrl+p":
+		if m.effortCursor > 0 {
+			m.effortCursor--
+		}
+	case "down", "ctrl+n":
+		if m.effortCursor < len(effortOptions)-1 {
+			m.effortCursor++
+		}
+	case "enter":
+		m.wizEffort = effortOptions[m.effortCursor]
+		m.mode = modeWizName
+		m.nameInput.SetValue(autoName(m.wizPicks))
+		m.nameInput.Focus()
+		m.nameInput.CursorEnd()
+		return m, nil
+	}
+	return m, nil
+}
+
 func (m pickModel) updateWizName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
-		m.wizStep = len(tierKeys) - 1
-		m.mode = modeWizModel
+		m.mode = modeWizEffort
 		m.nameInput.Blur()
 		return m, nil
 	case "enter":
@@ -585,6 +663,7 @@ func (m pickModel) updateWizName(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			Opus:   m.wizPicks[2],
 			Sonnet: m.wizPicks[3],
 			Haiku:  m.wizPicks[4],
+			Effort: m.wizEffort,
 		}
 		m.profiles = removeProfileByName(m.profiles, name)
 		m.profiles = append(m.profiles, p)
@@ -694,6 +773,8 @@ func (m pickModel) View() string {
 		b.WriteString(m.viewWizSub())
 	case modeWizModel:
 		b.WriteString(m.viewWizModel())
+	case modeWizEffort:
+		b.WriteString(m.viewWizEffort())
 	case modeWizName:
 		b.WriteString(m.viewWizName())
 	}
@@ -710,6 +791,8 @@ func (m pickModel) statusBar() string {
 		mode = "create: choose subscription (" + tierLabels[m.wizStep] + ")"
 	case modeWizModel:
 		mode = "create: choose model (" + tierLabels[m.wizStep] + ")"
+	case modeWizEffort:
+		mode = "create: choose effort"
 	case modeWizName:
 		mode = "create: name and save"
 	}
@@ -725,6 +808,12 @@ func (m pickModel) statusBar() string {
 	}
 	if m.refreshErr != "" {
 		return base + "  ! " + m.refreshErr
+	}
+	if m.burnRefreshErr != "" {
+		return base + "  ! burn refresh failed -- showing cached burn data (" + m.burnRefreshErr + ")"
+	}
+	if age := m.burn.oldestDataAge(time.Now()); age > burnStaleWarnAfter {
+		return base + fmt.Sprintf("  ! burn data %dd old", int(age.Hours()/24))
 	}
 	return base
 }
@@ -797,9 +886,11 @@ func (m pickModel) renderExpandedRow(p Profile) string {
 		}
 		payer := m.paidBy(s.id)
 		if payer == "" {
-			payer = styleDim.Render("(unresolved)")
+			fmt.Fprintf(&b, "    %-*s  %-*s  %s\n", labelW, s.key, idW, s.id, styleDim.Render("(unresolved)"))
+			continue
 		}
-		fmt.Fprintf(&b, "    %-*s  %-*s  %s\n", labelW, s.key, idW, s.id, payer)
+		// §S7: third column -- burn indicator keyed by the resolved payer.
+		fmt.Fprintf(&b, "    %-*s  %-*s  %s  %s\n", labelW, s.key, idW, s.id, payer, m.burnCell(payer, s.id))
 	}
 	return b.String()
 }
@@ -816,6 +907,56 @@ func (m pickModel) paidBy(id string) string {
 		entries = loadModelsCache(m.cachePath)
 	}
 	return payerForModelID(m.cfg, entries, id)
+}
+
+// burnProviders returns the on-hand provider -> model -> entry map, reading
+// the disk cache directly when the wizard has not run yet this session --
+// the same stale-tolerant, no-fetch fallback paidBy uses, so history-mode
+// expanded rows still show burn data without ever entering the wizard.
+func (m pickModel) burnProviders() map[string]map[string]burnEntry {
+	if m.burn.Providers != nil {
+		return m.burn.Providers
+	}
+	p, err := burnPath()
+	if err != nil {
+		return nil
+	}
+	return loadBurnFile(p).Providers
+}
+
+// burnBarLen scales a weight to bar glyphs: log2 growth from one glyph at
+// 1x, capped at eight (§S7).
+func burnBarLen(w float64) int {
+	if w <= 1 {
+		return 1
+	}
+	n := int(math.Log2(w)) + 1
+	if n > 8 {
+		n = 8
+	}
+	return n
+}
+
+// burnCell renders the bar + relative burn multiplier for one model id
+// under one provider (§S7). Weights are per-provider relative -- each
+// provider's lightest model is that screen's 1x, never one global scale. A
+// missing or Source:"none" entry renders the dim not-disclosed form, NEVER
+// "1x" (runbook hard rule). A measured row is labelled so it is never
+// mistaken for a provider figure.
+func (m pickModel) burnCell(provider, id string) string {
+	e, ok := m.burnProviders()[provider][id]
+	if !ok || e.Source == "none" || e.Weight <= 0 {
+		return styleDim.Render("—  (not disclosed)")
+	}
+	bar := strings.Repeat("▇", burnBarLen(e.Weight))
+	s := fmt.Sprintf("%s  ~%gx", bar, e.Weight)
+	if e.Source == "measured" {
+		s += " (measured)"
+	}
+	if e.Note != "" {
+		s += " " + e.Note
+	}
+	return s
 }
 
 func (m pickModel) viewWizSub() string {
@@ -859,14 +1000,51 @@ func (m pickModel) viewWizModel() string {
 	if len(ids) == 0 {
 		fmt.Fprintln(&b, styleDim.Render("no models match"))
 	}
+	// §S7: pad the id column the way renderExpandedRow does, then append the
+	// burn cell for this subscription.
+	idW := 0
+	for _, id := range ids {
+		if len(id) > idW {
+			idW = len(id)
+		}
+	}
 	for i, id := range ids {
+		line := fmt.Sprintf("%-*s  %s", idW, id, m.burnCell(sub, id))
 		if i == m.modelCursor {
-			fmt.Fprintln(&b, styleSel.Render("> "+id))
+			fmt.Fprintln(&b, styleSel.Render("> "+line))
 		} else {
-			fmt.Fprintln(&b, "  "+id)
+			fmt.Fprintln(&b, "  "+line)
 		}
 	}
 	fmt.Fprintln(&b, styleDim.Render("↑↓ move · type to filter · enter choose · esc back · q quit"))
+	return b.String()
+}
+
+func (m pickModel) viewWizEffort() string {
+	var b strings.Builder
+	fmt.Fprintln(&b, "effort -- applies to the whole session (main loop and all four subagent tiers)")
+	fmt.Fprintln(&b)
+	for i, k := range tierKeys {
+		row := orDash(m.wizPicks[i])
+		if k == "haiku" {
+			row += "  " + styleDim.Render("(haiku tier ignores effort)")
+		}
+		fmt.Fprintf(&b, "  %-6s %s\n", tierLabels[i]+":", row)
+	}
+	fmt.Fprintln(&b)
+	for i, opt := range effortOptions {
+		label := opt
+		if label == "" {
+			label = "(unset)  — keep Claude Code's own default"
+		}
+		if i == m.effortCursor {
+			fmt.Fprintln(&b, styleSel.Render("> "+label))
+		} else {
+			fmt.Fprintln(&b, "  "+label)
+		}
+	}
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, styleDim.Render("↑↓ move · enter choose · esc back · q quit"))
 	return b.String()
 }
 
@@ -878,6 +1056,7 @@ func (m pickModel) viewWizName() string {
 		fmt.Fprintf(&b, "  %-6s %s\n", tierLabels[i]+":", orDash(m.wizPicks[i]))
 		_ = k
 	}
+	fmt.Fprintf(&b, "  %-6s %s\n", "effort:", orDash(m.wizEffort))
 	fmt.Fprintln(&b, styleDim.Render("enter save & launch · esc back"))
 	return b.String()
 }

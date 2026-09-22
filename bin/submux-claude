@@ -3,7 +3,7 @@
 # four subagent tiers can each be pinned to a different id.
 #
 #   submux-claude --fable <id> --opus <id> --sonnet <id> --haiku <id> \
-#                  [--port N] [-- <claude args>]
+#                  [--effort LEVEL] [--port N] [-- <claude args>]
 #
 # Every --fable/--opus/--sonnet/--haiku flag is optional: an omitted tier is
 # left unset so Claude Code falls back to its own default for that tier.
@@ -17,6 +17,7 @@ OPUS_ID=""
 SONNET_ID=""
 HAIKU_ID=""
 MAIN_ID=""
+EFFORT=""
 
 # No tier flags at all means the flags-typing path is skipped entirely in
 # favor of the interactive picker (`submux pick`, spec §2.7): recorded
@@ -24,6 +25,7 @@ MAIN_ID=""
 PICK_IF_NO_FLAGS=1
 for arg in "$@"; do
   case "$arg" in
+    --effort) ;; # explicit --effort does not skip the picker
     --fable|--opus|--sonnet|--haiku) PICK_IF_NO_FLAGS=0 ;;
   esac
 done
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
     --opus) OPUS_ID="$2"; shift 2 ;;
     --sonnet) SONNET_ID="$2"; shift 2 ;;
     --haiku) HAIKU_ID="$2"; shift 2 ;;
+    --effort) EFFORT="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --) shift; break ;;
     *) echo "submux-claude: unknown argument: $1" >&2; exit 64 ;;
@@ -60,6 +63,7 @@ if [ "$PICK_IF_NO_FLAGS" -eq 1 ]; then
   OPUS_ID="${SUBMUX_OPUS:-}"
   SONNET_ID="${SUBMUX_SONNET:-}"
   HAIKU_ID="${SUBMUX_HAIKU:-}"
+  EFFORT="${EFFORT:-${SUBMUX_EFFORT:-}}"
 fi
 
 # Step 1: the OAuth bearer this whole tool depends on only appears when
@@ -115,7 +119,9 @@ if [ -n "$HAIKU_ID" ]; then
 fi
 
 # Step 5
-if [ -n "$MAIN_ID" ]; then
-  exec claude --model "$MAIN_ID" "$@"
-fi
-exec claude "$@"
+EXTRA=""
+[ -n "$MAIN_ID" ] && EXTRA="$EXTRA --model $MAIN_ID"
+[ -n "$EFFORT" ]  && EXTRA="$EXTRA --effort $EFFORT"
+# Unquoted $EXTRA is intentional and safe: values are picked from fixed enum or model id
+# shellcheck disable=SC2086
+exec claude $EXTRA "$@"
