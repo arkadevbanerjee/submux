@@ -25,6 +25,7 @@ type Profile struct {
 	Opus     string `json:"opus,omitempty"`
 	Sonnet   string `json:"sonnet,omitempty"`
 	Haiku    string `json:"haiku,omitempty"`
+	Effort   string `json:"effort,omitempty"` // "", low, medium, high, xhigh, max; "" = pass no --effort
 	Uses     int    `json:"uses"`
 	LastUsed string `json:"last_used,omitempty"` // RFC3339, empty if never launched
 }

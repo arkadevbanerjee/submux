@@ -3,7 +3,8 @@
 # four subagent tiers can each be pinned to a different id.
 #
 #   submux-claude --fable <id> --opus <id> --sonnet <id> --haiku <id> \
-#                  [--port N] [-- <claude args>]
+#                  [--effort LEVEL] [--port N] [-- <claude args>]
+#   submux-claude --last | --profile NAME [-- <claude args>]   # saved setup, no picker
 #
 # Every --fable/--opus/--sonnet/--haiku flag is optional: an omitted tier is
 # left unset so Claude Code falls back to its own default for that tier.
@@ -17,28 +18,43 @@ OPUS_ID=""
 SONNET_ID=""
 HAIKU_ID=""
 MAIN_ID=""
+EFFORT=""
 
 # No tier flags at all means the flags-typing path is skipped entirely in
 # favor of the interactive picker (`submux pick`, spec §2.7): recorded
 # BEFORE the flag loop below, since that loop consumes $@.
 PICK_IF_NO_FLAGS=1
+PROFILE=""
 for arg in "$@"; do
   case "$arg" in
-    --fable|--opus|--sonnet|--haiku) PICK_IF_NO_FLAGS=0 ;;
+    --) break ;;
+    --effort) ;; # explicit --effort does not skip the picker
+    --fable|--opus|--sonnet|--haiku|--last|--profile) PICK_IF_NO_FLAGS=0 ;;
   esac
 done
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --last) PROFILE="--last"; shift ;;
+    --profile) PROFILE="$2"; shift 2 ;;
     --fable) FABLE_ID="$2"; shift 2 ;;
     --opus) OPUS_ID="$2"; shift 2 ;;
     --sonnet) SONNET_ID="$2"; shift 2 ;;
     --haiku) HAIKU_ID="$2"; shift 2 ;;
+    --effort) EFFORT="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --) shift; break ;;
     *) echo "submux-claude: unknown argument: $1" >&2; exit 64 ;;
   esac
 done
+
+# Optional user hook, run before the picker so it sees any catalogue changes
+# the hook makes (e.g. syncing a proxy's model list). Its failure never
+# blocks a launch.
+PRELAUNCH="${XDG_CONFIG_HOME:-$HOME/.config}/submux/prelaunch"
+if [ -x "$PRELAUNCH" ]; then
+  "$PRELAUNCH" || echo "submux-claude: $PRELAUNCH exited non-zero; launching anyway" >&2
+fi
 
 # The interactive picker: only when none of --fable/--opus/--sonnet/--haiku
 # was passed. Explicit-flags callers (scripts) get byte-for-byte today's
@@ -60,7 +76,51 @@ if [ "$PICK_IF_NO_FLAGS" -eq 1 ]; then
   OPUS_ID="${SUBMUX_OPUS:-}"
   SONNET_ID="${SUBMUX_SONNET:-}"
   HAIKU_ID="${SUBMUX_HAIKU:-}"
+  EFFORT="${EFFORT:-${SUBMUX_EFFORT:-}}"
 fi
+
+# Fast path: --last (most recently used) or --profile NAME loads a saved setup
+# from profiles.json directly, no picker. Explicit tier flags still win.
+if [ -n "$PROFILE" ]; then
+  PROFILES="${XDG_CONFIG_HOME:-$HOME/.config}/submux/profiles.json"
+  if [ "$PROFILE" = "--last" ]; then
+    SEL='.profiles | sort_by(.last_used) | last'
+  else
+    SEL='.profiles[] | select(.name == $n)'
+  fi
+  P="$(jq -c --arg n "$PROFILE" "$SEL" "$PROFILES" 2>/dev/null || true)"
+  if [ -z "$P" ] || [ "$P" = "null" ]; then
+    echo "submux-claude: no saved profile ${PROFILE#--} in $PROFILES" >&2
+    exit 1
+  fi
+  pf() { printf '%s' "$P" | jq -r --arg k "$1" '.[$k] // ""'; }
+  MAIN_ID="$(pf main)"
+  FABLE_ID="${FABLE_ID:-$(pf fable)}"
+  OPUS_ID="${OPUS_ID:-$(pf opus)}"
+  SONNET_ID="${SONNET_ID:-$(pf sonnet)}"
+  HAIKU_ID="${HAIKU_ID:-$(pf haiku)}"
+  EFFORT="${EFFORT:-$(pf effort)}"
+fi
+
+# Claude Code names a model by parsing its id and only knows dashed versions:
+# "kiro/claude-opus-5.5" shows as "Opus 5". Hand Claude the dashed form when a
+# route's model_rewrite maps it back to the exact id picked; otherwise the id
+# passes through untouched.
+SUBMUX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/submux/config.json"
+claude_id() {
+  dashed="$(printf '%s' "$1" | sed 's/\(claude-[a-z]*-[0-9]*\)\.\([0-9]*\)/\1-\2/')"
+  if [ "$dashed" != "$1" ] && [ -r "$SUBMUX_CONFIG" ] && command -v jq >/dev/null 2>&1 &&
+    jq -e --arg d "$dashed" --arg o "$1" 'any(.routes[]?; .model_rewrite[$d]? == $o)' "$SUBMUX_CONFIG" >/dev/null 2>&1; then
+    printf '%s' "$dashed"
+  else
+    printf '%s' "$1"
+  fi
+}
+[ -n "$MAIN_ID" ] && MAIN_ID="$(claude_id "$MAIN_ID")"
+[ -n "$FABLE_ID" ] && FABLE_ID="$(claude_id "$FABLE_ID")"
+[ -n "$OPUS_ID" ] && OPUS_ID="$(claude_id "$OPUS_ID")"
+[ -n "$SONNET_ID" ] && SONNET_ID="$(claude_id "$SONNET_ID")"
+[ -n "$HAIKU_ID" ] && HAIKU_ID="$(claude_id "$HAIKU_ID")"
 
 # Step 1: the OAuth bearer this whole tool depends on only appears when
 # BOTH of these are unset (see README "Mechanism"); either one suppresses
@@ -115,7 +175,9 @@ if [ -n "$HAIKU_ID" ]; then
 fi
 
 # Step 5
-if [ -n "$MAIN_ID" ]; then
-  exec claude --model "$MAIN_ID" "$@"
-fi
-exec claude "$@"
+EXTRA=""
+[ -n "$MAIN_ID" ] && EXTRA="$EXTRA --model $MAIN_ID"
+[ -n "$EFFORT" ]  && EXTRA="$EXTRA --effort $EFFORT"
+# Unquoted $EXTRA is intentional and safe: values are picked from fixed enum or model id
+# shellcheck disable=SC2086
+exec claude $EXTRA "$@"
