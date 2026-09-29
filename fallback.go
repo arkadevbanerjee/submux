@@ -252,6 +252,14 @@ func (s *server) modifyResponse(resp *http.Response) error {
 	}
 	currentModel := ac.attempted[len(ac.attempted)-1]
 
+	// A route with no fallback candidates has nowhere to go, so cooling its
+	// only model would just turn one transient upstream error into
+	// cooldown_default of instant local 503s for every client retry. Pass
+	// the real upstream response through and leave the model un-cooled.
+	if len(ac.chain) == 0 {
+		return nil
+	}
+
 	if isFallbackStatus(resp.StatusCode, s.cfg.FallbackStatusCodes) {
 		cooldown := parseRetryAfterOrDefault(resp.Header.Get("Retry-After"), s.cfg.CooldownDefault)
 		until := time.Now().Add(cooldown)

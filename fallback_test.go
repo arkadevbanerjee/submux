@@ -316,3 +316,45 @@ func TestStreamingFallbackModelRewrite(t *testing.T) {
 		t.Errorf("rest of the stream missing or corrupted: %s", body)
 	}
 }
+
+// TestEmptyFallbackNeverCools: with "fallback": [] a triggering status must
+// not cool the model, so the client's next retry reaches upstream again
+// instead of getting cooldown_default of local 503s.
+func TestEmptyFallbackNeverCools(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"type":"error"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","model":"kiro/claude-opus-5.5"}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	empty := []string{}
+	routes := []route{
+		{match: "kiro/*", upstream: upstream.URL, upstreamURL: mustParseURL(t, upstream.URL), authKind: "none", fallback: &empty},
+	}
+	cfg := &config{
+		Listen: "127.0.0.1:0", MaxBodyBytes: defaultMaxBodyBytes, Routes: routes,
+		FallbackStatusCodes: []int{502}, CooldownDefault: time.Hour,
+	}
+	s := newServer(cfg, false)
+
+	for i, want := range []int{http.StatusBadGateway, http.StatusOK} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{"model":"kiro/claude-opus-5.5"}`)))
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("request %d: status = %d, want %d", i+1, rec.Code, want)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (second request must not be short-circuited by a cooldown)", got)
+	}
+	if len(s.cooldowns.snapshot(time.Now())) != 0 {
+		t.Errorf("model was cooled despite an empty fallback chain")
+	}
+}
