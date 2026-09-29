@@ -965,8 +965,14 @@ func (m pickModel) viewWizSub() string {
 	if len(m.catalog) == 0 {
 		fmt.Fprintln(&b, styleDim.Render("no subscriptions available"))
 	}
+	nameW := 28
+	for _, opt := range m.catalog {
+		if w := len([]rune(opt.Name)); w > nameW {
+			nameW = w
+		}
+	}
 	for i, opt := range m.catalog {
-		label := fmt.Sprintf("%-28s  %d id(s)", opt.Name, len(opt.ModelIDs))
+		label := fmt.Sprintf("%-*s  %d id(s)", nameW, opt.Name, len(opt.ModelIDs))
 		if opt.Unavailable != "" {
 			label = opt.Name + "  " + styleUnavail.Render("("+opt.Unavailable+")")
 			if len(opt.Upstreams) > 0 {

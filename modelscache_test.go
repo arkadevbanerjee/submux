@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -8,51 +11,61 @@ import (
 func testConfigForCatalog(upstream string) *config {
 	return &config{
 		Routes: []route{
-			{match: "claude-*", upstream: "https://api.anthropic.com", subscription: "Claude Max", models: []string{"claude-opus-5", "claude-sonnet-5"}},
-			{match: "*", upstream: upstream, authKind: "none"},
+			{match: "claude-*", upstream: upstream, subscription: "Claude Max", authKind: "none"},
 		},
 	}
 }
 
-// Test spec §4.6: a fixed-label route with "models" configured appears as a
-// selectable subscription with those ids; without the key it appears with
-// the explanatory line and is not selectable (Unavailable is set).
-func TestCatalogFixedLabelRouteWithAndWithoutModels(t *testing.T) {
-	url, _ := modelsServer(t, nil)
+// A fixed-label route's ids come from its live /v1/models, all filed under
+// the label regardless of owned_by. Nothing is configured: a model the
+// upstream adds shows up, one it drops disappears.
+func TestCatalogFixedLabelRouteListsLiveModels(t *testing.T) {
+	url, hits := modelsServer(t, []upstreamModel{{ID: "claude-opus-5-5", OwnedBy: "anthropic"}, {ID: "claude-new-6", OwnedBy: "whoever"}})
 	cfg := testConfigForCatalog(url)
-	entries := map[string]cacheEntry{}
-	cat := buildSubscriptionCatalog(cfg, entries, time.Now())
+	cat := buildSubscriptionCatalog(cfg, map[string]cacheEntry{}, time.Now())
+	if len(cat) != 1 || cat[0].Name != "Claude Max" || cat[0].Unavailable != "" {
+		t.Fatalf("catalog = %+v, want one selectable 'Claude Max' row", cat)
+	}
+	if got := cat[0].ModelIDs; len(got) != 2 || got[0] != "claude-new-6" || got[1] != "claude-opus-5-5" {
+		t.Fatalf("ModelIDs = %v, want the live list [claude-new-6 claude-opus-5-5]", got)
+	}
+	if len(cat[0].Upstreams) != 1 {
+		t.Fatalf("Upstreams = %v, want the route upstream so 'r' can refresh it", cat[0].Upstreams)
+	}
+	if *hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1", *hits)
+	}
+}
 
-	var maxOpt *subscriptionOption
-	for i := range cat {
-		if cat[i].Name == "Claude Max" {
-			maxOpt = &cat[i]
-		}
-	}
-	if maxOpt == nil {
-		t.Fatalf("catalog missing 'Claude Max' subscription: %+v", cat)
-	}
-	if maxOpt.Unavailable != "" {
-		t.Fatalf("configured models: Unavailable = %q, want empty", maxOpt.Unavailable)
-	}
-	if len(maxOpt.ModelIDs) != 2 {
-		t.Fatalf("configured models: ModelIDs = %v, want 2 entries", maxOpt.ModelIDs)
-	}
+// A passthrough route lists Anthropic's catalogue with the local Claude Code
+// login and follows has_more/last_id paging.
+func TestFetchUpstreamModelsPassthroughUsesLoginAndPages(t *testing.T) {
+	old := claudeLoginToken
+	claudeLoginToken = func() (string, error) { return "tok-123", nil }
+	t.Cleanup(func() { claudeLoginToken = old })
 
-	cfg2 := testConfigForCatalog(url)
-	cfg2.Routes[0].models = nil
-	cat2 := buildSubscriptionCatalog(cfg2, map[string]cacheEntry{}, time.Now())
-	var maxOpt2 *subscriptionOption
-	for i := range cat2 {
-		if cat2[i].Name == "Claude Max" {
-			maxOpt2 = &cat2[i]
+	var auths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization")+"|"+r.Header.Get("anthropic-beta"))
+		if r.URL.Query().Get("after_id") == "" {
+			fmt.Fprint(w, `{"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}`)
+			return
 		}
+		fmt.Fprint(w, `{"data":[{"id":"claude-b"}],"has_more":false,"last_id":"claude-b"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := fetchUpstreamModels(route{upstream: srv.URL, authKind: "passthrough"})
+	if err != nil {
+		t.Fatalf("fetchUpstreamModels: %v", err)
 	}
-	if maxOpt2 == nil {
-		t.Fatalf("catalog missing 'Claude Max' subscription: %+v", cat2)
+	if len(got) != 2 || got[0].ID != "claude-a" || got[1].ID != "claude-b" {
+		t.Fatalf("models = %+v, want both pages", got)
 	}
-	if maxOpt2.Unavailable == "" {
-		t.Fatalf("no models configured: expected Unavailable to explain why, got empty")
+	for _, a := range auths {
+		if a != "Bearer tok-123|oauth-2025-04-20" {
+			t.Fatalf("request auth = %q, want the login token with the oauth beta", a)
+		}
 	}
 }
 
@@ -107,9 +120,10 @@ func TestModelsForRouteStaleCacheUsedAndFlagged(t *testing.T) {
 // subscription -- buildSubscriptionCatalog still returns the OTHER
 // (fixed-label) subscription untouched.
 func TestCatalogDeadUpstreamDegradesOnlyThatSubscription(t *testing.T) {
+	okURL, _ := modelsServer(t, []upstreamModel{{ID: "claude-opus-5-5"}})
 	cfg := &config{
 		Routes: []route{
-			{match: "claude-*", upstream: "https://api.anthropic.com", subscription: "Claude Max", models: []string{"claude-opus-5"}},
+			{match: "claude-*", upstream: okURL, subscription: "Claude Max", authKind: "none"},
 			{match: "*", upstream: "http://127.0.0.1:1", authKind: "none"}, // nothing listens here
 		},
 	}

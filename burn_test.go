@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBurnProvider(t *testing.T) {
@@ -210,7 +211,9 @@ func TestBuildMeasuredBurnNormalization(t *testing.T) {
 	cfg := &config{Routes: []route{{
 		match: "claude-*", upstream: "https://api.anthropic.com",
 		subscription: "Claude Max",
-		models:       []string{"claude-fable-5", "claude-haiku-4-5", "claude-sonnet-5"},
+	}}}
+	liveList := map[string]cacheEntry{"https://api.anthropic.com": {FetchedAt: time.Now(), Models: []cachedModel{
+		{ID: "claude-fable-5"}, {ID: "claude-haiku-4-5"}, {ID: "claude-sonnet-5"},
 	}}}
 	daily := ccusageDailyJSON{Daily: []ccusageDay{
 		{Period: "20260921", ModelBreakdowns: []ccusageBreakdown{
@@ -223,7 +226,7 @@ func TestBuildMeasuredBurnNormalization(t *testing.T) {
 			{ModelName: "claude-sonnet-5", InputTokens: 500, OutputTokens: 500, CacheReadTokens: 500},
 		}},
 	}}
-	out := buildMeasuredBurn(cfg, nil, daily)
+	out := buildMeasuredBurn(cfg, liveList, daily)
 	entries := out["Claude Max"]
 	if len(entries) != 3 {
 		t.Fatalf("buildMeasuredBurn: %d entries, want 3 (mystery-model dropped); got %+v", len(entries), out)

@@ -179,11 +179,10 @@ func cmdCheck(args []string) {
 	}
 }
 
-// cmdModels implements `submux models` (§2.5): fetch every non-fixed-label
-// route's /v1/models once, group ids by resolved subscription, print
-// "SUBSCRIPTION (n ids): id, id, id ..." sorted by count desc. A route that
-// carries a fixed subscription label is skipped -- it has no catalogue to
-// list (the claude-* passthrough route, for example). A route whose
+// cmdModels implements `submux models` (§2.5): fetch every route's
+// /v1/models once, group ids by resolved subscription (a fixed-label route
+// files all its ids under its label), print
+// "SUBSCRIPTION (n ids): id, id, id ..." sorted by count desc. A route whose
 // credential or upstream fails is reported to stderr and skipped, so one
 // broken aggregator does not blank the whole command.
 func cmdModels(args []string) {
@@ -205,7 +204,7 @@ func cmdModels(args []string) {
 	// cliproxy); list each upstream's catalogue once, not once per route.
 	seenUpstream := map[string]bool{}
 	for _, rt := range cfg.Routes {
-		if rt.subscription != "" || seenUpstream[rt.upstream] {
+		if seenUpstream[rt.upstream] {
 			continue
 		}
 		seenUpstream[rt.upstream] = true
@@ -219,7 +218,10 @@ func cmdModels(args []string) {
 			continue
 		}
 		for _, m := range models {
-			name, _ := subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
+			name := rt.subscription
+			if name == "" {
+				name, _ = subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
+			}
 			buckets[name] = append(buckets[name], m.ID)
 		}
 	}

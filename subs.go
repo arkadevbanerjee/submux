@@ -12,6 +12,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -50,7 +53,9 @@ type upstreamModel struct {
 }
 
 type upstreamModelsResponse struct {
-	Data []upstreamModel `json:"data"`
+	Data    []upstreamModel `json:"data"`
+	HasMore bool            `json:"has_more"`
+	LastID  string          `json:"last_id"`
 }
 
 // resolveSubscription implements the §2.2 resolution order:
@@ -119,38 +124,92 @@ func subscriptionNameForOwnedBy(cfg *config, modelID, ownedBy string) (name, evi
 
 // fetchUpstreamModels performs the ONE network call this feature makes: a
 // GET <route upstream>/v1/models with a 5s timeout, using the route's own
-// resolved credential. Never called for a route with a fixed subscription
-// label (§2.1) -- resolveSubscription short-circuits before this.
+// resolved credential. A passthrough route (claude-*) has no credential of
+// its own, so it lists Anthropic's catalogue with this machine's Claude
+// Code OAuth login (claudeLoginToken) -- the same account the passthrough
+// forwards on the hot path. Anthropic pages the list (has_more/last_id);
+// every page is read so a new model never silently falls off the end.
 func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
-	url := strings.TrimRight(rt.upstream, "/") + "/v1/models"
+	base := strings.TrimRight(rt.upstream, "/") + "/v1/models"
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request for %s: %w", url, err)
-	}
-	switch rt.authKind {
-	case "bearer":
-		req.Header.Set("Authorization", "Bearer "+rt.authValue)
-	case "x-api-key":
-		req.Header.Set("x-api-key", rt.authValue)
+	var token string
+	if rt.authKind == "passthrough" {
+		t, err := claudeLoginToken()
+		if err != nil {
+			return nil, fmt.Errorf("list %s with the Claude Code login: %w", base, err)
+		}
+		token = t
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", url, err)
-	}
-	defer resp.Body.Close()
+	var out []upstreamModel
+	afterID := ""
+	for page := 0; page < 20; page++ {
+		url := base
+		if rt.authKind == "passthrough" {
+			url += "?limit=1000"
+			if afterID != "" {
+				url += "&after_id=" + afterID
+			}
+		}
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request for %s: %w", url, err)
+		}
+		switch rt.authKind {
+		case "bearer":
+			req.Header.Set("Authorization", "Bearer "+rt.authValue)
+		case "x-api-key":
+			req.Header.Set("x-api-key", rt.authValue)
+		case "passthrough":
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("anthropic-version", "2023-06-01")
+			req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: status %d", url, resp.StatusCode)
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GET %s: %w", base, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("GET %s: status %d", base, resp.StatusCode)
+		}
+		var parsed upstreamModelsResponse
+		err = json.NewDecoder(resp.Body).Decode(&parsed)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decode %s response: %w", base, err)
+		}
+		out = append(out, parsed.Data...)
+		if !parsed.HasMore || parsed.LastID == "" {
+			return out, nil
+		}
+		afterID = parsed.LastID
 	}
+	return out, nil
+}
 
-	var parsed upstreamModelsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return nil, fmt.Errorf("decode %s response: %w", url, err)
+// claudeLoginToken reads the OAuth access token Claude Code stores for this
+// user: the macOS keychain item "Claude Code-credentials" first, then
+// ~/.claude/.credentials.json. A var so tests can stub it. The token is
+// used only for the GET above and never logged.
+var claudeLoginToken = func() (string, error) {
+	var raw []byte
+	if out, err := exec.Command("security", "find-generic-password", "-s", "Claude Code-credentials", "-w").Output(); err == nil {
+		raw = out
+	} else if home, herr := os.UserHomeDir(); herr == nil {
+		raw, _ = os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
 	}
-	return parsed.Data, nil
+	var creds struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"claudeAiOauth"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &creds) != nil || creds.ClaudeAiOauth.AccessToken == "" {
+		return "", fmt.Errorf("no Claude Code login found (keychain \"Claude Code-credentials\" or ~/.claude/.credentials.json); run `claude` and log in")
+	}
+	return creds.ClaudeAiOauth.AccessToken, nil
 }
 
 // nearestIDs returns up to limit ids from ids that look like a typo of

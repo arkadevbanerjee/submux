@@ -206,11 +206,15 @@ func TestRefreshKeyTriggersUpstreamRefetch(t *testing.T) {
 func TestExpandedRowShowsPayerForSetSlot(t *testing.T) {
 	cfg := &config{
 		Routes: []route{
-			{match: "claude-*", upstream: "https://api.anthropic.com", subscription: "Claude Max", models: []string{"claude-opus-5"}},
+			{match: "claude-*", upstream: "https://api.anthropic.com", subscription: "Claude Max"},
 		},
 	}
+	cachePath := filepath.Join(t.TempDir(), "models-cache.json")
+	if err := saveModelsCache(cachePath, map[string]cacheEntry{"https://api.anthropic.com": {FetchedAt: time.Now(), Models: []cachedModel{{ID: "claude-opus-5"}}}}); err != nil {
+		t.Fatal(err)
+	}
 	profiles := []Profile{{Name: "max-plan", Main: "claude-opus-5", Uses: 1, LastUsed: time.Now().Format(time.RFC3339)}}
-	m := newPickModel(cfg, "/tmp/does-not-matter-profiles.json", "/tmp/does-not-matter-cache.json", "", profiles, "")
+	m := newPickModel(cfg, "/tmp/does-not-matter-profiles.json", cachePath, "", profiles, "")
 	m.cursor = 0 // expand the (only) row
 
 	view := m.View()

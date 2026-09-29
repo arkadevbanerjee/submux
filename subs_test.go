@@ -77,9 +77,9 @@ func TestResolveSubscriptionOwnedByMapAndUnmapped(t *testing.T) {
 	}
 }
 
-// Test 4: a route with a fixed subscription label makes NO HTTP request at
-// all -- the passthrough route answers from its config label alone, because
-// only the caller holds that OAuth.
+// Test 4: resolving which subscription pays for an id on a fixed-label route
+// makes NO HTTP request -- the label answers it. (Listing that route's
+// models is a separate, live call: modelscache_test.go.)
 func TestResolveSubscriptionFixedRouteNoNetworkCall(t *testing.T) {
 	url, hits := modelsServer(t, []upstreamModel{{ID: "claude-opus-5", OwnedBy: "anthropic"}})
 	cfg := &config{}

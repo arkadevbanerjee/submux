@@ -81,17 +81,16 @@ type subscriptionOption struct {
 	CacheAge    string // "" (fresh/no cache yet) or "cached 3h ago"
 
 	// Upstreams is the set of route upstream base URLs whose /v1/models
-	// feeds this option (empty for a fixed-label route, which has nothing
-	// to fetch -- only the caller holds that OAuth). Non-empty is what
-	// makes a row refreshable via the 'r' key (DEFECT 1, round 2).
+	// feeds this option. Non-empty is what makes a row refreshable via the
+	// 'r' key (DEFECT 1, round 2).
 	Upstreams []string
 }
 
 // buildSubscriptionCatalog assembles every selectable subscription across
-// cfg's routes: fixed-label routes contribute their configured "models"
-// list (or an explanatory unavailable entry if none is configured, §2.4),
-// and every other route's live /v1/models is fetched-or-cached and grouped
-// by subscriptionNameForOwnedBy, merging across routes that resolve to the
+// cfg's routes. Every route's model list is its live /v1/models,
+// fetched-or-cached; model ids are never configured. A fixed-label route
+// files all its ids under its label, every other route groups by
+// subscriptionNameForOwnedBy, merging across routes that resolve to the
 // same name. entries is mutated in place with any freshly fetched data;
 // callers persist it via saveModelsCache.
 func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now time.Time) []subscriptionOption {
@@ -116,20 +115,6 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 	}
 
 	for _, rt := range cfg.Routes {
-		if rt.subscription != "" {
-			if len(rt.models) == 0 {
-				add(subscriptionOption{
-					Name:        rt.subscription,
-					Unavailable: `no model list configured for this subscription -- add "models": [...] to its route`,
-				})
-				continue
-			}
-			ids := append([]string(nil), rt.models...)
-			sort.Strings(ids)
-			add(subscriptionOption{Name: rt.subscription, ModelIDs: ids})
-			continue
-		}
-
 		models, cacheAge, err := modelsForRoute(cfg, rt, entries, now)
 		if err != nil {
 			add(subscriptionOption{Name: routeUnavailableName(rt), Unavailable: err.Error(), Upstreams: []string{rt.upstream}})
@@ -137,7 +122,12 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 		}
 		byGroup := map[string][]string{}
 		for _, m := range models {
-			name, _ := subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
+			// A fixed-label route (claude-*) names its payer outright; only
+			// the model list itself comes from the upstream.
+			name := rt.subscription
+			if name == "" {
+				name, _ = subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
+			}
 			byGroup[name] = append(byGroup[name], m.ID)
 		}
 		names := make([]string, 0, len(byGroup))
@@ -256,11 +246,10 @@ func refreshSubscriptionCmd(cfg *config, subName string, upstreams []string) tea
 }
 
 // findRouteByUpstream locates the (non-fixed-label) route serving upstream,
-// so refreshSubscriptionCmd can resolve its credential. Fixed-label routes
-// are never returned: they have nothing to fetch.
+// so refreshSubscriptionCmd can resolve its credential.
 func findRouteByUpstream(cfg *config, upstream string) (route, bool) {
 	for _, rt := range cfg.Routes {
-		if rt.subscription == "" && rt.upstream == upstream {
+		if rt.upstream == upstream {
 			return rt, true
 		}
 	}
@@ -271,9 +260,9 @@ func findRouteByUpstream(cfg *config, upstream string) (route, bool) {
 // history screen's expanded row) by reusing subscriptionNameForOwnedBy
 // against the ALREADY-LOADED cached catalogue -- entries came from
 // loadModelsCache/ensureCatalog, never a fresh network call per keystroke.
-// A fixed-label route's configured "models" list resolves directly (its
+// An id cached under a fixed-label route resolves to that label (its
 // subscription name IS the payer, no owned_by involved). Returns "" if id
-// is not found in any route's config or any cached upstream entry.
+// is not found in any cached upstream entry.
 func payerForModelID(cfg *config, entries map[string]cacheEntry, id string) string {
 	if id == "" {
 		return ""
@@ -282,8 +271,8 @@ func payerForModelID(cfg *config, entries map[string]cacheEntry, id string) stri
 		if rt.subscription == "" {
 			continue
 		}
-		for _, m := range rt.models {
-			if m == id {
+		for _, m := range entries[rt.upstream].Models {
+			if m.ID == id {
 				return rt.subscription
 			}
 		}
