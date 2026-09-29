@@ -201,10 +201,14 @@ func cmdModels(args []string) {
 	}
 
 	buckets := map[string][]string{}
+	// Several routes may share one upstream (e.g. "kiro/*" and "*" both on
+	// cliproxy); list each upstream's catalogue once, not once per route.
+	seenUpstream := map[string]bool{}
 	for _, rt := range cfg.Routes {
-		if rt.subscription != "" {
+		if rt.subscription != "" || seenUpstream[rt.upstream] {
 			continue
 		}
+		seenUpstream[rt.upstream] = true
 		if err := resolveRouteCredential(&rt); err != nil {
 			fmt.Fprintf(os.Stderr, "submux models: route match=%q: %v\n", rt.match, err)
 			continue
