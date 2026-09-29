@@ -155,6 +155,11 @@ fi
 
 # Step 3
 export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
+# A custom base URL turns off deferred tool loading, so every MCP/deferred tool schema
+# ships on every request (~108k vs ~27k tokens for a bare prompt). Force it back on.
+export ENABLE_TOOL_SEARCH="${ENABLE_TOOL_SEARCH:-true}"
+# Tool input streaming is also off by default on gateways; Kiro handles it (tested).
+export CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING="${CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING:-1}"
 
 # Step 4: only export a tier's vars if an id was actually given for it.
 if [ -n "$FABLE_ID" ]; then
