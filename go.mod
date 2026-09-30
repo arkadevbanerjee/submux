@@ -1,4 +1,4 @@
-module submux
+module github.com/arkadevbanerjee/submux
 
 go 1.27
 
