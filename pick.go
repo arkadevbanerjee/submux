@@ -31,6 +31,7 @@ func cmdPick(args []string) {
 	fs := flag.NewFlagSet("pick", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to config.json")
 	outPath := fs.String("out", "", "file to write the chosen setup's KEY=VALUE lines to")
+	notice := fs.String("notice", "", "banner shown at the top, e.g. why the previous pick was refused")
 	_ = fs.Parse(args)
 
 	path, err := resolveConfigPath(*configPath)
@@ -51,6 +52,13 @@ func cmdPick(args []string) {
 		log.Fatalf("submux: %v", err)
 	}
 	profiles, warning := loadProfiles(pPath)
+	if *notice != "" {
+		if warning != "" {
+			warning = *notice + " · " + warning
+		} else {
+			warning = *notice
+		}
+	}
 
 	tty, ttyErr := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if ttyErr != nil {
@@ -164,6 +172,7 @@ const (
 	modeWizModel
 	modeWizEffort
 	modeWizName
+	modeWizFallback // Enter on a dead subscription row: ask before pointing at its free fallback
 )
 
 var effortOptions = [6]string{"", "low", "medium", "high", "xhigh", "max"}
@@ -188,6 +197,11 @@ type pickModel struct {
 	catalogWarn  string
 	probes       map[string]probeResult // subscription -> latest probe, re-applied after every catalog rebuild
 	probesSent   bool                   // ONE background probe batch per picker session
+
+	modelProbes   map[string]map[string]probeResult // subscription -> model id -> per-model probe
+	modelProbedAt map[string]time.Time              // subscription -> when its models were last probed
+	notice        string                            // one-line reason shown under the list (why Enter did nothing)
+	fbTo          int                               // catalog index of the fallback offered in modeWizFallback
 
 	burn               burnFile // loaded from disk by ensureCatalog, merged by burnRefreshMsg (§S8)
 	burnRefreshChecked bool     // ONE background burn refresh per picker session, never blocking
@@ -345,6 +359,12 @@ func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			applyProbes(m.cfg, m.catalog, m.probes)
 		}
 		return m, nil
+	case modelProbeMsg:
+		if m.modelProbes == nil {
+			m.modelProbes = map[string]map[string]probeResult{}
+		}
+		m.modelProbes[msg.sub] = msg.results
+		return m, nil
 	case burnRefreshMsg:
 		// §S8: msg.burn always started from the previous file, so even a
 		// failed refresh keeps the stale data already on screen; the error
@@ -424,6 +444,8 @@ func (m pickModel) startRefresh() (pickModel, tea.Cmd) {
 	if len(opt.Upstreams) == 0 {
 		return m, nil
 	}
+	delete(m.modelProbes, opt.Name) // a renewed login must re-check its models too
+	delete(m.modelProbedAt, opt.Name)
 	m.refreshing = true
 	m.refreshTarget = opt.Name
 	m.refreshErr = ""
@@ -456,6 +478,8 @@ func (m pickModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateWizEffort(msg)
 	case modeWizName:
 		return m.updateWizName(msg)
+	case modeWizFallback:
+		return m.updateWizFallback(msg)
 	}
 	return m, nil
 }
@@ -591,13 +615,54 @@ func (m pickModel) updateWizSub(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		opt := m.catalog[m.subCursor]
+		m.notice = ""
 		if opt.Unavailable != "" {
-			return m, nil // not selectable, matches spec §2.4
+			// Never selectable (spec §2.4), and never swapped silently: offer the
+			// configured free fallback and let the user say yes.
+			fb := fallbackFor(m.cfg, opt.Name)
+			for i, c := range m.catalog {
+				if fb != "" && c.Name == fb && c.Unavailable == "" {
+					m.fbTo = i
+					m.mode = modeWizFallback
+					return m, nil
+				}
+			}
+			m.notice = opt.Name + " is unavailable and has no free fallback configured"
+			return m, nil
 		}
-		m.mode = modeWizModel
-		m.modelCursor = 0
-		m.modelFilter.SetValue("")
-		m.modelFilter.Focus()
+		return m.openModelPane()
+	}
+	return m, nil
+}
+
+// openModelPane enters the model list for the subscription under subCursor and
+// starts a per-model probe (skipped while a recent one is still fresh).
+func (m pickModel) openModelPane() (tea.Model, tea.Cmd) {
+	m.mode = modeWizModel
+	m.modelCursor = 0
+	m.modelFilter.SetValue("")
+	m.modelFilter.Focus()
+	opt := m.catalog[m.subCursor]
+	if at, ok := m.modelProbedAt[opt.Name]; ok && time.Since(at) < modelProbeFreshFor {
+		return m, nil
+	}
+	if m.modelProbedAt == nil {
+		m.modelProbedAt = map[string]time.Time{}
+	}
+	m.modelProbedAt[opt.Name] = time.Now()
+	return m, probeModelsCmd(m.cfg, opt.Name, opt.ModelIDs)
+}
+
+// updateWizFallback answers "use <free fallback> instead?": y goes to the
+// fallback's model list (the user still picks the model), anything else returns.
+func (m pickModel) updateWizFallback(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.subCursor = m.fbTo
+		m.notice = ""
+		return m.openModelPane()
+	case "n", "N", "esc", "q", "enter":
+		m.mode = modeWizSub
 	}
 	return m, nil
 }
@@ -624,6 +689,7 @@ func (m pickModel) updateWizModel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeWizSub
+		m.notice = ""
 		m.modelFilter.Blur()
 		return m, nil
 	case "ctrl+r":
@@ -647,6 +713,14 @@ func (m pickModel) updateWizModel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.modelCursor >= len(ids) {
 			return m, nil
 		}
+		if m.subCursor < len(m.catalog) {
+			r, ok := m.modelProbes[m.catalog[m.subCursor].Name][ids[m.modelCursor]]
+			if why, blocked := modelBlocked(r, ok); blocked {
+				m.notice = ids[m.modelCursor] + " cannot answer: " + why
+				return m, nil
+			}
+		}
+		m.notice = ""
 		m.wizPicks[m.wizStep] = ids[m.modelCursor]
 		return m.advanceWizStep()
 	}
@@ -836,6 +910,8 @@ func (m pickModel) View() string {
 		b.WriteString(m.viewWizEffort())
 	case modeWizName:
 		b.WriteString(m.viewWizName())
+	case modeWizFallback:
+		b.WriteString(m.viewWizFallback())
 	}
 
 	fmt.Fprintln(&b, hr(w))
@@ -854,6 +930,8 @@ func (m pickModel) statusBar() string {
 		mode = "create: choose effort"
 	case modeWizName:
 		mode = "create: name and save"
+	case modeWizFallback:
+		mode = "create: confirm free fallback"
 	}
 	model := "-"
 	if m.mode == modeWizModel || m.mode == modeWizSub {
@@ -1066,7 +1144,21 @@ func (m pickModel) viewWizSub() string {
 			fmt.Fprintln(&b, "  "+label)
 		}
 	}
+	if m.notice != "" {
+		fmt.Fprintln(&b, styleWarn.Render("! "+m.notice))
+	}
 	fmt.Fprintln(&b, styleDim.Render("↑↓/jk move · enter choose · s skip tier · r refresh · esc back · q quit"))
+	return b.String()
+}
+
+// viewWizFallback is the explicit y/n before the free fallback is offered.
+func (m pickModel) viewWizFallback() string {
+	var b strings.Builder
+	from := m.catalog[m.subCursor]
+	to := m.catalog[m.fbTo]
+	fmt.Fprintf(&b, "%s\n  %s\n\n", from.Name, styleUnavail.Render(from.Unavailable))
+	fmt.Fprintf(&b, "Use %s instead?  (y = open its models, n = back)\n", styleSel.Render(" "+to.Name+" "))
+	fmt.Fprintln(&b, styleDim.Render("y yes · n/esc back · q back"))
 	return b.String()
 }
 
@@ -1092,11 +1184,20 @@ func (m pickModel) viewWizModel() string {
 	}
 	for i, id := range ids {
 		line := fmt.Sprintf("%-*s  %s", idW, id, m.burnCell(sub, id))
+		r, probed := m.modelProbes[sub][id]
+		if why, blocked := modelBlocked(r, probed); blocked {
+			line = fmt.Sprintf("%-*s  ", idW, id) + styleUnavail.Render("("+why+")")
+		} else if !probed && m.modelProbesPending(sub) {
+			line += styleDim.Render("  checking…")
+		}
 		if i == m.modelCursor {
 			fmt.Fprintln(&b, styleSel.Render("> "+line))
 		} else {
 			fmt.Fprintln(&b, "  "+line)
 		}
+	}
+	if m.notice != "" {
+		fmt.Fprintln(&b, styleWarn.Render("! "+m.notice))
 	}
 	fmt.Fprintln(&b, styleDim.Render("↑↓ move · type to filter · ctrl+r refresh · enter choose · esc back · q quit"))
 	return b.String()
@@ -1141,4 +1242,11 @@ func (m pickModel) viewWizName() string {
 	fmt.Fprintf(&b, "  %-6s %s\n", "effort:", orDash(m.wizEffort))
 	fmt.Fprintln(&b, styleDim.Render("enter save & launch · esc back"))
 	return b.String()
+}
+
+// modelProbesPending reports whether sub's per-model probe batch is still in flight.
+func (m pickModel) modelProbesPending(sub string) bool {
+	_, started := m.modelProbedAt[sub]
+	_, done := m.modelProbes[sub]
+	return started && !done
 }

@@ -56,6 +56,87 @@ if [ -x "$PRELAUNCH" ]; then
   "$PRELAUNCH" || echo "submux-claude: $PRELAUNCH exited non-zero; launching anyway" >&2
 fi
 
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/submux"
+LOG_FILE="$STATE_DIR/submux.log"
+mkdir -p "$STATE_DIR"
+
+# Claude Code names a model by parsing its id and only knows dashed versions:
+# "kiro/claude-opus-5.5" shows as "Opus 5". Hand Claude the dashed form when a
+# route's model_rewrite maps it back to the exact id picked; otherwise the id
+# passes through untouched.
+SUBMUX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/submux/config.json"
+claude_id() {
+  dashed="$(printf '%s' "$1" | sed 's/\(claude-[a-z]*-[0-9]*\)\.\([0-9]*\)/\1-\2/')"
+  if [ "$dashed" != "$1" ] && [ -r "$SUBMUX_CONFIG" ] && command -v jq >/dev/null 2>&1 &&
+    jq -e --arg d "$dashed" --arg o "$1" 'any(.routes[]?; .model_rewrite[$d]? == $o)' "$SUBMUX_CONFIG" >/dev/null 2>&1; then
+    printf '%s' "$dashed"
+  else
+    printf '%s' "$1"
+  fi
+}
+normalize_ids() {
+  [ -n "$MAIN_ID" ] && MAIN_ID="$(claude_id "$MAIN_ID")"
+  [ -n "$FABLE_ID" ] && FABLE_ID="$(claude_id "$FABLE_ID")"
+  [ -n "$OPUS_ID" ] && OPUS_ID="$(claude_id "$OPUS_ID")"
+  [ -n "$SONNET_ID" ] && SONNET_ID="$(claude_id "$SONNET_ID")"
+  [ -n "$HAIKU_ID" ] && HAIKU_ID="$(claude_id "$HAIKU_ID")"
+  return 0
+}
+
+
+# Start submux serve if nothing is already listening on $PORT.
+ensure_server() {
+  if ! nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; then
+    if ! command -v submux >/dev/null 2>&1; then
+      echo "submux-claude: no 'submux' binary on PATH; build it with 'go build -o /path/on/PATH/submux .' first" >&2
+      exit 1
+    fi
+    nohup submux serve --listen "127.0.0.1:$PORT" >>"$LOG_FILE" 2>&1 &
+
+    waited=0
+    until nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; do
+      if [ "$waited" -ge 3000 ]; then
+        echo "submux-claude: submux serve did not come up on port $PORT within 3s; see $LOG_FILE" >&2
+        exit 1
+      fi
+      sleep 0.1
+      waited=$((waited + 100))
+    done
+  fi
+}
+
+# Step 2b: refuse to launch on a dead main model. A picked model whose provider login has
+# expired (cliproxy 503 auth_unavailable) used to fall back to another model silently
+# while the screen kept showing the picked name. Probe ONLY the main model (the other
+# tiers fail loud on first use), 6s cap; a timeout is not a failure, it just proceeds.
+# A pass is cached 5 minutes per id so repeat launches cost nothing.
+# Skip with SUBMUX_SKIP_PREFLIGHT=1.
+# preflight: sets PREFLIGHT_ERR and returns 1 when the main model cannot answer.
+preflight() {
+  PREFLIGHT_ERR=""
+  [ -n "${SUBMUX_SKIP_PREFLIGHT:-}" ] && return 0
+  id="${MAIN_ID:-${OPUS_ID:-${FABLE_ID:-${SONNET_ID:-$HAIKU_ID}}}}"
+  case "$id" in "" | claude-*) return 0 ;; esac
+  okfile="$STATE_DIR/preflight-ok.$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '_')"
+  [ -n "$(find "$okfile" -mmin -5 2>/dev/null)" ] && return 0
+  probe_id="${id%\[1m\]}"
+  body="$(jq -nc --arg m "$probe_id" '{model:$m,max_tokens:1,messages:[{role:"user",content:"hi"}]}')"
+  out="$(curl -s -m 6 -o - -w '\n%{http_code}' "http://127.0.0.1:$PORT/v1/messages" \
+    -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+    -H "X-Claude-Code-Session-Id: $(uuidgen)" -d "$body" 2>/dev/null || true)"
+  code="$(printf '%s' "$out" | tail -n1)"
+  case "$code" in
+    200) : >"$okfile" ;;
+    "" | 000) echo "submux-claude: warning: '$id' did not answer the 6s health probe; launching anyway" >&2 ;;
+    *)
+      msg="$(printf '%s' "$out" | sed '$d' | jq -r '.error.message // empty' 2>/dev/null | cut -c1-300)"
+      PREFLIGHT_ERR="model '$id' is unavailable (HTTP $code): ${msg:-no response}"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 # The interactive picker: only when none of --fable/--opus/--sonnet/--haiku
 # was passed. Explicit-flags callers (scripts) get byte-for-byte today's
 # behaviour below, untouched.
@@ -66,17 +147,31 @@ if [ "$PICK_IF_NO_FLAGS" -eq 1 ]; then
   fi
   PICK_OUT="$(mktemp)"
   trap 'rm -f "$PICK_OUT"' EXIT INT TERM
-  if ! submux pick --out "$PICK_OUT"; then
-    exit 1
-  fi
-  # shellcheck disable=SC1090
-  . "$PICK_OUT"
-  MAIN_ID="${SUBMUX_MAIN:-}"
-  FABLE_ID="${SUBMUX_FABLE:-}"
-  OPUS_ID="${SUBMUX_OPUS:-}"
-  SONNET_ID="${SUBMUX_SONNET:-}"
-  HAIKU_ID="${SUBMUX_HAIKU:-}"
-  EFFORT="${EFFORT:-${SUBMUX_EFFORT:-}}"
+  PICK_NOTICE=""
+  EFFORT_FLAG="$EFFORT"
+  while :; do
+    : >"$PICK_OUT"
+    if ! submux pick --out "$PICK_OUT" ${PICK_NOTICE:+--notice "$PICK_NOTICE"}; then
+      exit 1
+    fi
+    SUBMUX_MAIN="" SUBMUX_FABLE="" SUBMUX_OPUS="" SUBMUX_SONNET="" SUBMUX_HAIKU="" SUBMUX_EFFORT=""
+    # shellcheck disable=SC1090
+    . "$PICK_OUT"
+    MAIN_ID="${SUBMUX_MAIN:-}"
+    FABLE_ID="${SUBMUX_FABLE:-}"
+    OPUS_ID="${SUBMUX_OPUS:-}"
+    SONNET_ID="${SUBMUX_SONNET:-}"
+    HAIKU_ID="${SUBMUX_HAIKU:-}"
+    EFFORT="${EFFORT_FLAG:-${SUBMUX_EFFORT:-}}"
+    # A dead pick goes back to the picker with the reason, instead of exiting.
+    normalize_ids
+    ensure_server
+    if preflight; then
+      PREFLIGHT_DONE=1
+      break
+    fi
+    PICK_NOTICE="$PREFLIGHT_ERR"
+  done
 fi
 
 # Fast path: --last (most recently used) or --profile NAME loads a saved setup
@@ -102,26 +197,6 @@ if [ -n "$PROFILE" ]; then
   EFFORT="${EFFORT:-$(pf effort)}"
 fi
 
-# Claude Code names a model by parsing its id and only knows dashed versions:
-# "kiro/claude-opus-5.5" shows as "Opus 5". Hand Claude the dashed form when a
-# route's model_rewrite maps it back to the exact id picked; otherwise the id
-# passes through untouched.
-SUBMUX_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/submux/config.json"
-claude_id() {
-  dashed="$(printf '%s' "$1" | sed 's/\(claude-[a-z]*-[0-9]*\)\.\([0-9]*\)/\1-\2/')"
-  if [ "$dashed" != "$1" ] && [ -r "$SUBMUX_CONFIG" ] && command -v jq >/dev/null 2>&1 &&
-    jq -e --arg d "$dashed" --arg o "$1" 'any(.routes[]?; .model_rewrite[$d]? == $o)' "$SUBMUX_CONFIG" >/dev/null 2>&1; then
-    printf '%s' "$dashed"
-  else
-    printf '%s' "$1"
-  fi
-}
-[ -n "$MAIN_ID" ] && MAIN_ID="$(claude_id "$MAIN_ID")"
-[ -n "$FABLE_ID" ] && FABLE_ID="$(claude_id "$FABLE_ID")"
-[ -n "$OPUS_ID" ] && OPUS_ID="$(claude_id "$OPUS_ID")"
-[ -n "$SONNET_ID" ] && SONNET_ID="$(claude_id "$SONNET_ID")"
-[ -n "$HAIKU_ID" ] && HAIKU_ID="$(claude_id "$HAIKU_ID")"
-
 # Step 1: the OAuth bearer this whole tool depends on only appears when
 # BOTH of these are unset (see README "Mechanism"); either one suppresses
 # it silently, so unset both and say so if we changed anything.
@@ -130,59 +205,14 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
 fi
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN || true
 
-# Step 2: start submux serve if nothing is already listening on $PORT.
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/submux"
-LOG_FILE="$STATE_DIR/submux.log"
-mkdir -p "$STATE_DIR"
-
-if ! nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; then
-  if ! command -v submux >/dev/null 2>&1; then
-    echo "submux-claude: no 'submux' binary on PATH; build it with 'go build -o /path/on/PATH/submux .' first" >&2
-    exit 1
-  fi
-  nohup submux serve --listen "127.0.0.1:$PORT" >>"$LOG_FILE" 2>&1 &
-
-  waited=0
-  until nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; do
-    if [ "$waited" -ge 3000 ]; then
-      echo "submux-claude: submux serve did not come up on port $PORT within 3s; see $LOG_FILE" >&2
-      exit 1
-    fi
-    sleep 0.1
-    waited=$((waited + 100))
-  done
-fi
-
-# Step 2b: refuse to launch on a dead main model. A picked model whose provider login has
-# expired (cliproxy 503 auth_unavailable) used to fall back to another model silently
-# while the screen kept showing the picked name. Probe ONLY the main model (the other
-# tiers fail loud on first use), 6s cap; a timeout is not a failure, it just proceeds.
-# A pass is cached 5 minutes per id so repeat launches cost nothing.
-# Skip with SUBMUX_SKIP_PREFLIGHT=1.
-if [ -z "${SUBMUX_SKIP_PREFLIGHT:-}" ]; then
-  id="${MAIN_ID:-${OPUS_ID:-${FABLE_ID:-${SONNET_ID:-$HAIKU_ID}}}}"
-  case "$id" in "" | claude-*) id="" ;; esac
-  if [ -n "$id" ]; then
-    okfile="$STATE_DIR/preflight-ok.$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '_')"
-    if [ -z "$(find "$okfile" -mmin -5 2>/dev/null)" ]; then
-      probe_id="${id%\[1m\]}"
-      body="$(jq -nc --arg m "$probe_id" '{model:$m,max_tokens:1,messages:[{role:"user",content:"hi"}]}')"
-      out="$(curl -s -m 6 -o - -w '\n%{http_code}' "http://127.0.0.1:$PORT/v1/messages" \
-        -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
-        -H "X-Claude-Code-Session-Id: $(uuidgen)" -d "$body" 2>/dev/null || true)"
-      code="$(printf '%s' "$out" | tail -n1)"
-      case "$code" in
-        200) : >"$okfile" ;;
-        "" | 000) echo "submux-claude: warning: '$id' did not answer the 6s health probe; launching anyway" >&2 ;;
-        *)
-          msg="$(printf '%s' "$out" | sed '$d' | jq -r '.error.message // empty' 2>/dev/null | cut -c1-300)"
-          echo "submux-claude: REFUSING TO LAUNCH: model '$id' is unavailable (HTTP $code): ${msg:-no response}" >&2
-          echo "submux-claude: fix the provider login, or override with SUBMUX_SKIP_PREFLIGHT=1" >&2
-          exit 1
-          ;;
-      esac
-    fi
-  fi
+# Step 2: make sure the relay is up and the main model answers (the picker path already did
+# both, and went back to the picker on failure; this covers --last, --profile and tier flags).
+normalize_ids
+ensure_server
+if [ -z "${PREFLIGHT_DONE:-}" ] && ! preflight; then
+  echo "submux-claude: REFUSING TO LAUNCH: $PREFLIGHT_ERR" >&2
+  echo "submux-claude: fix the provider login, or override with SUBMUX_SKIP_PREFLIGHT=1" >&2
+  exit 1
 fi
 
 # Step 3

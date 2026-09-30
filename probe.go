@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -199,4 +200,70 @@ func applyProbes(cfg *config, catalog []subscriptionOption, results map[string]p
 		}
 		catalog[i].Unavailable = msg
 	}
+}
+
+// fallbackFor returns the free fallback subscription configured for sub's
+// probe ("" when none).
+func fallbackFor(cfg *config, sub string) string {
+	for _, p := range cfg.SubscriptionProbes {
+		if p.Subscription == sub {
+			return p.Fallback
+		}
+	}
+	return ""
+}
+
+const (
+	maxModelProbes     = 24 // each probe is a real 1-token request, and Kiro bills per request
+	modelProbeParallel = 6
+	modelProbeFreshFor = 10 * time.Minute
+)
+
+// modelProbeMsg carries one subscription's per-model probe batch back to the picker.
+type modelProbeMsg struct {
+	sub     string
+	results map[string]probeResult // model id -> result
+}
+
+// probeModelsCmd probes up to maxModelProbes of ids in sub, a few at a time,
+// off the UI goroutine. Models it does not reach stay selectable (unchecked).
+func probeModelsCmd(cfg *config, sub string, ids []string) tea.Cmd {
+	if len(ids) > maxModelProbes {
+		ids = ids[:maxModelProbes]
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	ids = append([]string(nil), ids...)
+	return func() tea.Msg {
+		results := make(map[string]probeResult, len(ids))
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, modelProbeParallel)
+		for _, id := range ids {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(id string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				r := probeSubscription(cfg, subscriptionProbe{Subscription: sub, Model: id})
+				mu.Lock()
+				results[id] = r
+				mu.Unlock()
+			}(id)
+		}
+		wg.Wait()
+		return modelProbeMsg{sub: sub, results: results}
+	}
+}
+
+// modelBlocked reports whether a per-model probe says id cannot answer, and why.
+func modelBlocked(r probeResult, ok bool) (string, bool) {
+	if !ok || (r.State != "ended" && r.State != "down") {
+		return "", false
+	}
+	if r.State == "down" {
+		return "not answering: " + r.Detail, true
+	}
+	return r.Detail, true
 }

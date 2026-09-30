@@ -1,9 +1,13 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -283,4 +287,112 @@ func TestCtrlRRefreshesOnModelPaneAndReportsOutcome(t *testing.T) {
 	if !strings.Contains(next.statusBar(), "refreshed xai (unmapped)") {
 		t.Fatalf("status bar = %q, want a 'refreshed ...' outcome even with no change", next.statusBar())
 	}
+}
+
+func fallbackModel() pickModel {
+	cfg := &config{SubscriptionProbes: []subscriptionProbe{{Subscription: "ChatGPT", Model: "gpt-5.5", Fallback: "Zen"}}}
+	m := newPickModel(cfg, "/tmp/x-profiles.json", "/tmp/x-cache.json", "", nil, "")
+	m.mode = modeWizSub
+	m.burnRefreshChecked, m.probesSent = true, true
+	m.catalog = []subscriptionOption{
+		{Name: "ChatGPT", ModelIDs: []string{"gpt-a"}, Unavailable: "subscription ended or inactive: login expired"},
+		{Name: "Zen", ModelIDs: []string{"zen-a"}},
+		{Name: "Dead", ModelIDs: []string{"d"}, Unavailable: "ended"},
+	}
+	return m
+}
+
+func press(m pickModel, k string) pickModel {
+	var msg tea.KeyMsg
+	switch k {
+	case "enter":
+		msg = tea.KeyMsg{Type: tea.KeyEnter}
+	case "esc":
+		msg = tea.KeyMsg{Type: tea.KeyEsc}
+	default:
+		msg = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+	}
+	next, _ := m.Update(msg)
+	return next.(pickModel)
+}
+
+// Enter on a dead row asks before offering the free fallback; it never switches by itself.
+func TestEnterOnDeadRowAsksBeforeFallback(t *testing.T) {
+	m := press(fallbackModel(), "enter")
+	if m.mode != modeWizFallback || m.fbTo != 1 {
+		t.Fatalf("Enter on a dead row: mode=%v fbTo=%d, want the confirm prompt offering Zen", m.mode, m.fbTo)
+	}
+	if v := m.View(); !strings.Contains(v, "Use ") || !strings.Contains(v, "Zen") {
+		t.Fatalf("prompt does not name the fallback:\n%s", v)
+	}
+	no := press(m, "n")
+	if no.mode != modeWizSub || no.wizPicks != [5]string{} || no.subCursor != 0 {
+		t.Fatalf("n: mode=%v picks=%v cursor=%d, want back on the list, nothing chosen", no.mode, no.wizPicks, no.subCursor)
+	}
+	yes, cmd := func() (pickModel, tea.Cmd) {
+		n, c := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+		return n.(pickModel), c
+	}()
+	if yes.mode != modeWizModel || yes.subCursor != 1 || yes.wizPicks != [5]string{} {
+		t.Fatalf("y: mode=%v cursor=%d picks=%v, want Zen's model list with nothing chosen yet", yes.mode, yes.subCursor, yes.wizPicks)
+	}
+	if cmd == nil {
+		t.Fatalf("y: no per-model probe dispatched for the fallback's models")
+	}
+}
+
+func TestEnterOnDeadRowWithoutFallbackSaysSo(t *testing.T) {
+	m := fallbackModel()
+	m.subCursor = 2
+	m = press(m, "enter")
+	if m.mode != modeWizSub || !strings.Contains(m.notice, "no free fallback") {
+		t.Fatalf("dead row with no fallback: mode=%v notice=%q", m.mode, m.notice)
+	}
+}
+
+func TestModelProbeGreysAndBlocksModel(t *testing.T) {
+	m := fallbackModel()
+	m.subCursor = 1
+	m.mode = modeWizModel
+	m.catalog[1].ModelIDs = []string{"zen-a", "zen-b"}
+	next, _ := m.Update(modelProbeMsg{sub: "Zen", results: map[string]probeResult{
+		"zen-a": {State: "ended", Detail: "quota exhausted (HTTP 400)"},
+		"zen-b": {State: "ok"},
+	}})
+	m = next.(pickModel)
+	if v := m.View(); !strings.Contains(v, "quota exhausted") {
+		t.Fatalf("dead model shows no reason:\n%s", v)
+	}
+	m = press(m, "enter") // cursor on zen-a
+	if m.mode != modeWizModel || m.wizPicks[0] != "" || !strings.Contains(m.notice, "zen-a") {
+		t.Fatalf("Enter on a dead model: mode=%v picks=%v notice=%q, want refused with a reason", m.mode, m.wizPicks, m.notice)
+	}
+	m.modelCursor = 1
+	m = press(m, "enter")
+	if m.wizPicks[0] != "zen-b" {
+		t.Fatalf("Enter on a live model: picks=%v, want zen-b", m.wizPicks)
+	}
+}
+
+func TestProbeModelsCmdProbesEachIDOnce(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if strings.Contains(readBody(r), `"model":"bad"`) {
+			w.WriteHeader(402)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	cfg := &config{Routes: []route{{match: "*", upstream: srv.URL, authKind: "none"}}}
+	msg := probeModelsCmd(cfg, "S", []string{"good", "bad"})().(modelProbeMsg)
+	if hits.Load() != 2 || msg.results["good"].State != "ok" || msg.results["bad"].State != "ended" {
+		t.Fatalf("hits=%d results=%+v", hits.Load(), msg.results)
+	}
+}
+
+func readBody(r *http.Request) string {
+	b, _ := io.ReadAll(r.Body)
+	return string(b)
 }
