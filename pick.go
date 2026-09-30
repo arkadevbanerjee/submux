@@ -66,7 +66,7 @@ func cmdPick(args []string) {
 		// list read from stdin, never hang, never touch the alt-screen.
 		os.Exit(runPlainPicker(cfg, pPath, profiles, *outPath))
 	}
-	defer tty.Close()
+	defer func() { _ = tty.Close() }()
 
 	m := newPickModel(cfg, pPath, cPath, *outPath, profiles, warning)
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(tty), tea.WithOutput(tty))
@@ -103,7 +103,7 @@ func runPlainPicker(cfg *config, pPath string, profiles []Profile, outPath strin
 	}
 	line := strings.TrimSpace(scanner.Text())
 	idx := -1
-	fmt.Sscanf(line, "%d", &idx)
+	_, _ = fmt.Sscanf(line, "%d", &idx) // non-numeric input leaves idx at -1
 	if idx < 1 || idx > len(profiles) {
 		fmt.Fprintln(os.Stderr, "submux pick: invalid selection")
 		return 1

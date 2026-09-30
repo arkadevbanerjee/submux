@@ -345,7 +345,7 @@ func fetchGLMBurn() (map[string]burnEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", providerGLM, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", providerGLM, err)
@@ -358,7 +358,7 @@ func fetchChatGPTBurn() (map[string]burnEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", providerChatGPT, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", providerChatGPT, err)
@@ -371,7 +371,7 @@ func fetchOpenCodeBurn() (map[string]burnEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", providerOpenCode, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", providerOpenCode, err)

@@ -87,7 +87,7 @@ func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 			return res
 		}
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		out = classifyProbe(p.Subscription, resp.StatusCode, string(snippet))
 		if out.State != "down" { // only a 5xx is retried: one blip must not hide a live model
 			break

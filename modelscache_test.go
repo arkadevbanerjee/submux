@@ -49,10 +49,10 @@ func TestFetchUpstreamModelsPassthroughUsesLoginAndPages(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization")+"|"+r.Header.Get("anthropic-beta"))
 		if r.URL.Query().Get("after_id") == "" {
-			fmt.Fprint(w, `{"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}`)
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"claude-a"}],"has_more":true,"last_id":"claude-a"}`)
 			return
 		}
-		fmt.Fprint(w, `{"data":[{"id":"claude-b"}],"has_more":false,"last_id":"claude-b"}`)
+		_, _ = fmt.Fprint(w, `{"data":[{"id":"claude-b"}],"has_more":false,"last_id":"claude-b"}`)
 	}))
 	t.Cleanup(srv.Close)
 
