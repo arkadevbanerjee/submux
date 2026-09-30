@@ -205,7 +205,7 @@ func (s *server) pickNext(ac *attemptCtx) (string, route, bool) {
 			ac.tried[id] = true
 			continue
 		}
-		rt, ok := matchRoute(s.cfg.Routes, id)
+		rt, ok := matchRoute(s.conf().Routes, id)
 		if !ok {
 			ac.tried[id] = true
 			continue
@@ -260,8 +260,8 @@ func (s *server) modifyResponse(resp *http.Response) error {
 		return nil
 	}
 
-	if isFallbackStatus(resp.StatusCode, s.cfg.FallbackStatusCodes) {
-		cooldown := parseRetryAfterOrDefault(resp.Header.Get("Retry-After"), s.cfg.CooldownDefault)
+	if isFallbackStatus(resp.StatusCode, s.conf().FallbackStatusCodes) {
+		cooldown := parseRetryAfterOrDefault(resp.Header.Get("Retry-After"), s.conf().CooldownDefault)
 		until := time.Now().Add(cooldown)
 		s.cooldowns.markCooling(currentModel, until)
 

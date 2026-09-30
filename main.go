@@ -100,6 +100,8 @@ func cmdServe(args []string) {
 		log.Printf("submux: route %s", describeRoute(r))
 	}
 
+	go srv.watchConfig(path, reloadPollEvery)
+
 	httpSrv := &http.Server{Handler: srv}
 	if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("submux: serve: %v", err)

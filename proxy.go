@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,7 +44,7 @@ type bodyModelOnly struct {
 // shared ReverseProxy configured once with FlushInterval: -1 (streaming
 // hangs otherwise), and the debug-headers flag.
 type server struct {
-	cfg          *config
+	cfgp         atomic.Pointer[config] // swapped whole on a config hot reload; read through conf()
 	debugHeaders bool
 	proxy        *httputil.ReverseProxy
 	cooldowns    *cooldownStore
@@ -51,8 +52,12 @@ type server struct {
 	served       *servedStore // nil in tests; set by cmdServe
 }
 
+// conf returns the live config. A hot reload replaces the pointer, never the pointee.
+func (s *server) conf() *config { return s.cfgp.Load() }
+
 func newServer(cfg *config, debugHeaders bool) *server {
-	s := &server{cfg: cfg, debugHeaders: debugHeaders, cooldowns: newCooldownStore(), history: newFallbackHistory()}
+	s := &server{debugHeaders: debugHeaders, cooldowns: newCooldownStore(), history: newFallbackHistory()}
+	s.cfgp.Store(cfg)
 	s.proxy = &httputil.ReverseProxy{
 		FlushInterval: -1, // flush on every write; anything else buffers SSE and the CLI appears to hang.
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -78,7 +83,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := s.cfg.MaxBodyBytes
+	limit := s.conf().MaxBodyBytes
 	buf, overflowed, err := readBodyLimited(r.Body, limit)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "submux: failed to read request body")
@@ -97,14 +102,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var rt route
 	var matched bool
-	if noModel && s.cfg.NoModelRoute != nil {
+	if noModel && s.conf().NoModelRoute != nil {
 		// no_model_route: a model-less request (an Anthropic control call,
 		// not a completion) is routed here instead of the ordinary glob
 		// match, so it never lands on an aggregator that has no idea what
 		// it is. A request WITH a model field never takes this branch.
-		rt, matched = *s.cfg.NoModelRoute, true
+		rt, matched = *s.conf().NoModelRoute, true
 	} else {
-		rt, matched = matchRoute(s.cfg.Routes, bm.Model)
+		rt, matched = matchRoute(s.conf().Routes, bm.Model)
 	}
 	if !matched {
 		writeAnthropicError(w, http.StatusBadGateway, "invalid_request_error", "submux: no route matched and no \"*\" fallback is configured")
@@ -129,7 +134,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ac := &attemptCtx{
 		requestedModel: bm.Model,
 		originalBody:   buf,
-		chain:          rt.fallbackChain(s.cfg),
+		chain:          rt.fallbackChain(s.conf()),
 		tried:          map[string]bool{bm.Model: true},
 		attempted:      []string{bm.Model},
 		isAgent:        r.Header.Get("x-claude-code-agent-id") != "",

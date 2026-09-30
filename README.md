@@ -221,6 +221,33 @@ rather than a crash. Run `submux pick --out <file>` directly to inspect the
 `SUBMUX_MAIN`/`SUBMUX_FABLE`/`SUBMUX_OPUS`/`SUBMUX_SONNET`/`SUBMUX_HAIKU`/
 `SUBMUX_PROFILE` lines it writes.
 
+### Everyday use: `sc`
+
+`bin/sc` (symlink it onto PATH) is the short front door. Plain `sc` relaunches
+the last setup; `sc -p` opens the picker; `sc sol` launches the saved setup
+whose alias, name or main model matches "sol" (most recently used wins when
+several match); `sc -l` lists setups; `sc --alias NAME ALIAS` names one.
+Anything after the word goes to `claude`.
+
+- **No silent fallbacks.** Keep `default_fallback` and per-route `fallback` at
+  `[]`: a failing model then returns its real error instead of another model
+  answering under the picked name.
+- **Launch guard.** Before `claude` starts, the main model gets a 1-token probe
+  (6s cap, pass cached 5 min). A dead login or exhausted quota refuses the
+  launch, or sends you back to the picker when you chose from it.
+  `SUBMUX_SKIP_PREFLIGHT=1` skips it.
+- **Picker.** Models whose subscription is down or out of quota are greyed
+  with the reason; per-model probes grey single dead models. Enter on a dead
+  subscription asks before opening its configured free fallback.
+- **Status line.** The launcher adds a status line (`submux statusline`) that
+  shows the model the relay really sent the request to, per session, and turns
+  loud on an error or a fallback. Skipped when you have your own `statusLine`;
+  `SUBMUX_NO_STATUSLINE=1` turns it off.
+- **Hot reload.** `serve` re-reads `config.json` within 2s of a change (or on
+  `SIGHUP`); a bad edit is logged and ignored. A changed `listen` needs a restart.
+- **Launch warnings.** A cliproxy login that stopped refreshing, and `--resume`
+  or `--continue`, print a warning and continue.
+
 ## Caveats
 
 - This relies on the current, **undocumented** behaviour of Claude Code's
