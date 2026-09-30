@@ -1,5 +1,9 @@
 # submux
 
+[![CI](https://github.com/arkadevbanerjee/submux/actions/workflows/ci.yml/badge.svg)](https://github.com/arkadevbanerjee/submux/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/arkadevbanerjee/submux/badge)](https://scorecard.dev/viewer/?uri=github.com/arkadevbanerjee/submux)
+[![Go Reference](https://pkg.go.dev/badge/github.com/arkadevbanerjee/submux.svg)](https://pkg.go.dev/github.com/arkadevbanerjee/submux)
+
 A local relay that lets one Claude Code session run its four subagent tiers
 (fable, opus, sonnet, haiku) on four different backends. It dispatches on the
 model id already present in each request body, and it never substitutes one

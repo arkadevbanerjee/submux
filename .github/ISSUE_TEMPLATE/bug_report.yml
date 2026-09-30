@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in submux behaves wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove tokens, API keys and account emails from anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. submux check claude-sonnet-5-5
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines or config (redacted)
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: submux version or commit
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS, Go and Claude Code versions
