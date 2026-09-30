@@ -153,27 +153,36 @@ if ! nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; then
   done
 fi
 
-# Step 2b: refuse to launch on a dead upstream. A picked model whose provider login has
+# Step 2b: refuse to launch on a dead main model. A picked model whose provider login has
 # expired (cliproxy 503 auth_unavailable) used to fall back to another model silently
-# while the screen kept showing the picked name. Probe each non-Claude id with a
-# 1-token request; any non-200 aborts with the upstream's own message.
+# while the screen kept showing the picked name. Probe ONLY the main model (the other
+# tiers fail loud on first use), 6s cap; a timeout is not a failure, it just proceeds.
+# A pass is cached 5 minutes per id so repeat launches cost nothing.
 # Skip with SUBMUX_SKIP_PREFLIGHT=1.
 if [ -z "${SUBMUX_SKIP_PREFLIGHT:-}" ]; then
-  for id in $(printf '%s\n' "$MAIN_ID" "$FABLE_ID" "$OPUS_ID" "$SONNET_ID" "$HAIKU_ID" | sort -u); do
-    case "$id" in "" | claude-*) continue ;; esac
-    probe_id="${id%\[1m\]}"
-    body="$(jq -nc --arg m "$probe_id" '{model:$m,max_tokens:1,messages:[{role:"user",content:"hi"}]}')"
-    out="$(curl -s -m 40 -o - -w '\n%{http_code}' "http://127.0.0.1:$PORT/v1/messages" \
-      -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
-      -H "X-Claude-Code-Session-Id: $(uuidgen)" -d "$body" 2>/dev/null || true)"
-    code="$(printf '%s' "$out" | tail -n1)"
-    if [ "$code" != "200" ]; then
-      msg="$(printf '%s' "$out" | sed '$d' | jq -r '.error.message // empty' 2>/dev/null | cut -c1-300)"
-      echo "submux-claude: REFUSING TO LAUNCH: model '$id' is unavailable (HTTP ${code:-none}): ${msg:-no response}" >&2
-      echo "submux-claude: fix the provider login, or override with SUBMUX_SKIP_PREFLIGHT=1" >&2
-      exit 1
+  id="${MAIN_ID:-${OPUS_ID:-${FABLE_ID:-${SONNET_ID:-$HAIKU_ID}}}}"
+  case "$id" in "" | claude-*) id="" ;; esac
+  if [ -n "$id" ]; then
+    okfile="$STATE_DIR/preflight-ok.$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '_')"
+    if [ -z "$(find "$okfile" -mmin -5 2>/dev/null)" ]; then
+      probe_id="${id%\[1m\]}"
+      body="$(jq -nc --arg m "$probe_id" '{model:$m,max_tokens:1,messages:[{role:"user",content:"hi"}]}')"
+      out="$(curl -s -m 6 -o - -w '\n%{http_code}' "http://127.0.0.1:$PORT/v1/messages" \
+        -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+        -H "X-Claude-Code-Session-Id: $(uuidgen)" -d "$body" 2>/dev/null || true)"
+      code="$(printf '%s' "$out" | tail -n1)"
+      case "$code" in
+        200) : >"$okfile" ;;
+        "" | 000) echo "submux-claude: warning: '$id' did not answer the 6s health probe; launching anyway" >&2 ;;
+        *)
+          msg="$(printf '%s' "$out" | sed '$d' | jq -r '.error.message // empty' 2>/dev/null | cut -c1-300)"
+          echo "submux-claude: REFUSING TO LAUNCH: model '$id' is unavailable (HTTP $code): ${msg:-no response}" >&2
+          echo "submux-claude: fix the provider login, or override with SUBMUX_SKIP_PREFLIGHT=1" >&2
+          exit 1
+          ;;
+      esac
     fi
-  done
+  fi
 fi
 
 # Step 3
