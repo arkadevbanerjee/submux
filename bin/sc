@@ -1,0 +1,71 @@
+#!/bin/sh
+# sc: short front door for submux-claude.
+#
+#   sc                     relaunch the last setup (what your old alias did)
+#   sc -p                  open the picker
+#   sc sol [claude args]   launch the saved profile that matches "sol"
+#   sc -l                  list saved profiles (alias, main model, effort, uses)
+#   sc --alias NAME ALIAS  give a profile a short alias (NAME may be any sc match)
+#
+# A word matches a profile by exact alias, exact name, then a case-insensitive
+# substring of alias, name or main model id. Several matches: the most recently
+# used wins and sc says which. Anything after the word goes to claude.
+set -eu
+
+PROFILES="${XDG_CONFIG_HOME:-$HOME/.config}/submux/profiles.json"
+LAUNCH="$(dirname "$0")/submux-claude"
+[ -x "$LAUNCH" ] || LAUNCH=submux-claude
+
+die() { echo "sc: $*" >&2; exit 1; }
+need_profiles() { [ -r "$PROFILES" ] || die "no saved profiles yet ($PROFILES); run sc to create one"; }
+
+# resolve WORD: print the full profile name of the best match, all matches on stderr
+resolve() {
+  jq -r --arg q "$1" '
+    def lc: ascii_downcase;
+    ($q | lc) as $w
+    | [.profiles[]] as $all
+    | ([$all[] | select((.alias // "" | lc) == $w)]) as $a
+    | ([$all[] | select((.name | lc) == $w)]) as $n
+    | ([$all[] | select(((.alias // "") + " " + .name + " " + .main) | lc | contains($w))]) as $s
+    | (if ($a | length) > 0 then $a elif ($n | length) > 0 then $n else $s end)
+    | sort_by(.last_used) | reverse | map(.name) | .[]' "$PROFILES"
+}
+
+case "${1:-}" in
+  "") exec "$LAUNCH" --last ;;
+  -p | --pick | pick) shift; exec "$LAUNCH" -- "$@" ;;
+  -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -l | --list)
+    need_profiles
+    jq -r '.profiles | sort_by(.last_used) | reverse[] | [(.alias // "-"), .main, .effort, "\(.uses)x", .name] | @tsv' "$PROFILES" |
+      column -t -s "$(printf '\t')"
+    exit 0
+    ;;
+  --alias)
+    [ $# -eq 3 ] || die "usage: sc --alias NAME ALIAS"
+    need_profiles
+    full="$(resolve "$2" | head -n1)"
+    [ -n "$full" ] || die "no profile matches '$2'"
+    if [ -n "$(jq -r --arg a "$3" --arg n "$full" '.profiles[] | select(.alias == $a and .name != $n) | .name' "$PROFILES")" ]; then
+      die "alias '$3' is already used by another profile"
+    fi
+    tmp="$(mktemp)"
+    jq --arg n "$full" --arg a "$3" '(.profiles[] | select(.name == $n) | .alias) = $a' "$PROFILES" >"$tmp" && mv "$tmp" "$PROFILES"
+    echo "sc: '$3' -> $full"
+    exit 0
+    ;;
+  -*) die "unknown option $1 (try sc --help)" ;;
+esac
+
+need_profiles
+word="$1"
+shift
+matches="$(resolve "$word")"
+[ -n "$matches" ] || die "no profile matches '$word' (sc -l lists them)"
+full="$(printf '%s\n' "$matches" | head -n1)"
+count="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
+if [ "$count" -gt 1 ]; then
+  echo "sc: '$word' matched $count profiles, using the most recent: $full" >&2
+fi
+exec "$LAUNCH" --profile "$full" -- "$@"

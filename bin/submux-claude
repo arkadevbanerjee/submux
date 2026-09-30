@@ -86,7 +86,7 @@ if [ -n "$PROFILE" ]; then
   if [ "$PROFILE" = "--last" ]; then
     SEL='.profiles | sort_by(.last_used) | last'
   else
-    SEL='.profiles[] | select(.name == $n)'
+    SEL='.profiles[] | select(.name == $n or .alias == $n)'
   fi
   P="$(jq -c --arg n "$PROFILE" "$SEL" "$PROFILES" 2>/dev/null || true)"
   if [ -z "$P" ] || [ "$P" = "null" ]; then
