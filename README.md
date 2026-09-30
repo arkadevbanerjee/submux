@@ -1,262 +1,264 @@
 # submux
 
 A local relay that lets one Claude Code session run its four subagent tiers
-(fable, opus, sonnet, haiku) on four different backends, by dispatching on
-the model id already present in each request body.
+(fable, opus, sonnet, haiku) on four different backends. It dispatches on the
+model id already present in each request body, and it never substitutes one
+model for another unless you explicitly configure a fallback.
 
-## Mechanism
+- [Quick start](#quick-start)
+- [Everyday use: `sc`](#everyday-use-sc)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Launcher and picker](#launcher-and-picker)
+- [Troubleshooting](#troubleshooting)
+- [Limits and caveats](#limits-and-caveats)
 
-Claude Code picks a subagent's model from the `ANTHROPIC_DEFAULT_FABLE_MODEL`,
-`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, and
-`ANTHROPIC_DEFAULT_HAIKU_MODEL` environment variables (each with a `_NAME`
-twin used for display). Those four ids are the only routing signal a relay
-sitting behind `ANTHROPIC_BASE_URL` ever sees; they arrive as the `model`
-field of the outgoing JSON request body.
+## Quick start
 
-With `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` both unset, Claude Code
-authenticates to whatever `ANTHROPIC_BASE_URL` points at using its own
-subscription OAuth bearer (an `Authorization: Bearer sk-ant-o...` header).
-Setting either env var suppresses that bearer. A relay that forwards this
-header untouched to `api.anthropic.com` is indistinguishable, from
-Anthropic's point of view, from the CLI talking to it directly — so
-`claude-*` subagents keep running on your own Anthropic subscription, while
-every other model id is routed (with its own separate credential) to
-whatever other API-compatible aggregator you already run for the rest of
-your subscriptions. submux does not talk to Anthropic or any other provider
-on its own; it only relays requests the CLI was already about to send.
-
-## What it does not do
-
-No format translation between API schemas, no account rotation or
-failover, no usage dashboard, no request caching, no config hot-reload, no
-install script. If your aggregator speaks a different wire format than
-Anthropic's Messages API, that translation is its job, not submux's.
-
-## Build
-
-Go 1.27+. The relay itself (`serve`, `routes`, `check`, `models`, `status`)
-is standard library only, no external modules, and nothing below reaches
-its hot path. `submux pick` (the interactive setup picker, see below) pulls
-in `github.com/charmbracelet/bubbletea`, `bubbles`, and `lipgloss` for its
-TUI -- deliberately, once, for that one command only:
+Requires Go 1.27+ and Claude Code. The relay (`serve`, `routes`, `check`,
+`models`, `status`) is standard library only. Only `submux pick` pulls in
+`bubbletea`, `bubbles` and `lipgloss`, for its TUI.
 
 ```sh
-go build -o /usr/local/bin/submux .
+go build -o ~/bin/submux .                    # build the relay
+mkdir -p ~/.config/submux
+cp config.example.json ~/.config/submux/config.json   # edit routes and auth
+ln -s "$PWD/bin/submux-claude" ~/bin/submux-claude
+ln -s "$PWD/bin/sc" ~/bin/sc                  # short front door, needs jq
+
+submux check claude-sonnet-5-5                # which route and subscription pays for an id
+sc -p                                         # pick models in the TUI and launch Claude Code
 ```
 
-## Configure
+The launcher starts `submux serve` on the configured port if nothing is
+listening, so you do not run the relay by hand. To run it detached yourself:
 
-Default config path: `~/.config/submux/config.json` (override with
-`--config`). See `config.example.json`:
+```sh
+nohup submux serve --listen 127.0.0.1:8787 >> ~/.local/state/submux/submux.log 2>&1 &
+```
+
+## Everyday use: `sc`
+
+`bin/sc` is the short front door to `submux-claude`. Plain `claude` is never
+touched, so keep using it for normal sessions.
+
+| Command | Does |
+|---|---|
+| `sc` | Relaunch the last setup |
+| `sc -p` | Open the picker |
+| `sc sol` | Launch the saved setup whose alias, name or main model matches `sol` (most recently used wins) |
+| `sc -l` | List saved setups |
+| `sc --alias NAME ALIAS` | Name a setup (the picker's `a` key does the same) |
+
+Anything after the word goes to `claude`, for example `sc sol --resume`.
+
+Safety behavior built in:
+
+- **No silent fallbacks.** Keep `default_fallback` and per-route `fallback` at
+  `[]`. A failing model then returns its real error instead of another model
+  answering under the picked name.
+- **Launch guard.** Before `claude` starts, the main model gets a 1-token probe
+  (6s cap, a pass is cached for 5 minutes). A dead login or exhausted quota
+  refuses the launch, or returns you to the picker if you chose from it.
+  `SUBMUX_SKIP_PREFLIGHT=1` skips it.
+- **Picker.** Models whose subscription is down or out of quota are greyed out
+  with the reason and cannot be chosen. Per-model probes grey single dead
+  models. Enter on a dead subscription asks before opening its configured free
+  fallback. A subscription can opt out of per-model probing with
+  `skip_model_probe` in `subscription_probes` (use it where every request is billed).
+- **Status line.** The launcher adds a status line (`submux statusline`) that
+  shows the model the relay really sent each request to, per session, and turns
+  loud on an error or a fallback. It is skipped when you have your own
+  `statusLine`; `SUBMUX_NO_STATUSLINE=1` turns it off.
+- **Hot reload.** `serve` re-reads `config.json` within 2s of a change, or on
+  `SIGHUP`. A bad edit is logged and ignored. A changed `listen` needs a restart.
+- **Launch warnings.** A cliproxy login that stopped refreshing, and
+  `--resume` or `--continue`, print a warning and continue.
+
+## How it works
+
+Claude Code picks a subagent's model from the `ANTHROPIC_DEFAULT_FABLE_MODEL`,
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL` and
+`ANTHROPIC_DEFAULT_HAIKU_MODEL` environment variables (each has a `_NAME` twin
+used for display). Those four ids are the only routing signal a relay behind
+`ANTHROPIC_BASE_URL` ever sees, as the `model` field of the outgoing JSON body.
+
+With `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` both unset, Claude Code
+authenticates to `ANTHROPIC_BASE_URL` with its own subscription OAuth bearer.
+Setting either variable suppresses that bearer. A relay that forwards the
+header untouched to `api.anthropic.com` looks, from Anthropic's side, like the
+CLI talking to it directly. So `claude-*` subagents keep running on your own
+subscription, and every other model id is routed, with its own credential, to
+whatever API-compatible aggregator you already run.
+
+```
+claude  ->  submux :8787  ->  api.anthropic.com        (claude-*, passthrough auth)
+                          ->  aggregator :8317         (everything else, own credential)
+```
+
+submux does not talk to any provider on its own. It only relays requests the
+CLI was already about to send.
+
+**Out of scope:** format translation between API schemas (your aggregator's
+job), account rotation, a usage dashboard, request caching, an install script.
+
+## Configuration
+
+Default path: `~/.config/submux/config.json` (override with `--config`). Start
+from `config.example.json`:
 
 ```json
 {
   "listen": "127.0.0.1:8787",
   "max_body_bytes": 67108864,
-  "default_fallback": ["glm-5.3", "gpt-5.6-luna", "grok-4.6"],
+  "default_fallback": [],
   "fallback_status_codes": [429, 402, 403, 500, 502, 503, 529],
   "cooldown_default_seconds": 300,
   "routes": [
     {
-      "match": "claude-fable-*",
-      "upstream": "https://api.anthropic.com",
-      "auth": "passthrough",
-      "fallback": ["claude-opus-5", "gpt-5.6-luna", "glm-5.3"]
-    },
-    {
       "match": "claude-*",
       "upstream": "https://api.anthropic.com",
-      "auth": "passthrough"
+      "auth": "passthrough",
+      "fallback": []
     },
     {
       "match": "*",
       "upstream": "http://127.0.0.1:8317",
-      "auth": "bearer:keychain:local-aggregator/API_TOKEN"
+      "auth": "bearer:keychain:local-aggregator/API_TOKEN",
+      "fallback": []
     }
   ]
 }
 ```
 
-- `match` is a glob over the whole model id string: `*` matches any run of
-  characters (including `/`, since real model ids from some aggregators
-  contain slashes, e.g. `some-vendor/some-model`), `?` matches exactly one
-  character. Routes are tried in order; the first match wins, so a bare
-  `"*"` fallback route must be last.
-- `auth` is one of:
-  - `passthrough` — forward the caller's own credential untouched. Use this
-    only for a route you trust with your own subscription credential.
-  - `bearer:env:VAR` — send `Authorization: Bearer $VAR`.
-  - `bearer:keychain:<service>/<account>` — read the credential once at
-    startup from the macOS login keychain
-    (`security find-generic-password -s <service> -a <account> -w`); a
-    missing entry is a startup error, not a silent 401.
-  - `x-api-key:env:VAR` — send `x-api-key: $VAR` instead of `Authorization`.
-  - `none` — send no credential at all.
-- `model_rewrite` (optional) — a map applied to the body's `model` field
-  before forwarding, for that route only. This is the one case where the
-  request body is re-serialized; every other route forwards the original
-  bytes untouched.
-- `fallback` (optional, per route) — an ordered, unbounded list of model ids
-  to try, in order, if this route's upstream returns a status in
-  `fallback_status_codes` (default `429, 402, 403, 500, 502, 503, 529`) and
-  no response byte has reached the client yet. **Absent** means "inherit
-  `default_fallback`"; **present and empty** (`"fallback": []`) means "never
-  fall back on this route, fail loud" — the two are deliberately different,
-  so an owner's explicit opt-out is never silently re-enabled. Each chain
-  entry is a model id, re-resolved from the top of the route table (so it
-  picks up whatever upstream, credential and `model_rewrite` that id
-  normally uses); no id is ever retried twice for the same request, even if
-  it appears in its own chain.
-- `default_fallback` (optional, top-level) — the fallback chain used by any
-  route that has no `fallback` key of its own. Applies to every request,
-  including your main-loop session, not just subagents.
-- `cooldown_default_seconds` (optional, top-level, default `300`) — how long
-  a model id that just triggered a fallback status is skipped entirely on
-  later requests, unless the upstream's own `Retry-After` says otherwise.
-  Cooldowns are in-memory only and reset on restart.
-- `subscription` (optional, per route) — a FIXED "which subscription pays
-  for this" label for the whole route. `submux check`/`submux models` print
-  it with NO upstream lookup; this is the only way to answer for a
-  `passthrough` route, since only the caller holds that OAuth and submux has
-  no catalogue to query.
-- `models` (optional, per route, only meaningful alongside `subscription`) —
-  a fixed list of model ids for `submux pick`'s create wizard to offer for
-  that subscription, since a `passthrough` route's own upstream can't be
-  listed (same reason as above). A `subscription` route with no `models`
-  shows up in the wizard as a single explanatory, unselectable line instead
-  of an empty list.
-- `subscriptions` (optional, top-level) — a map from an upstream
-  `/v1/models` `owned_by` value to a human subscription name, used by any
-  route with no fixed `subscription` label. An `owned_by` with no entry here
-  prints raw, tagged `(unmapped)`, rather than being silently guessed at.
-- `subscription_overrides` (optional, top-level) — an ordered list of
-  `{"match": "<model glob>", "subscription": "<name>"}`, checked BEFORE
-  `subscriptions`. Exists because some aggregators' `owned_by` names the
-  wire protocol, not the payer (e.g. reporting `"anthropic"` for a model
-  actually billed to a different coding plan) — the override corrects that
-  without waiting on the aggregator to fix its own label.
-- `no_model_route` (optional, top-level) — the route a request with no
-  `"model"` field (or a non-JSON body) is sent to, instead of falling
-  through to ordinary glob matching on an empty model id. These are
-  Anthropic control calls the CLI makes on its own, not completions, so
-  routing them onto a non-Anthropic aggregator's fallback route just gets a
-  404. The value must equal the `match` of exactly one configured route, or
-  config load fails naming the bad value and listing the available route
-  matches. **Absent** means "use the first route in order whose `auth` is
-  `passthrough`"; if no route is `passthrough` at all, it keeps today's
-  behaviour and uses the `"*"` fallback route. A request that DOES carry a
-  `model` field is never affected by this key. Such requests log as
-  `model="" (no-model -> <matched glob>)` so the reason is visible.
+### Routes
+
+`match` is a glob over the whole model id. `*` matches any run of characters
+(including `/`, since some aggregators use ids like `vendor/model`) and `?`
+matches exactly one. Routes are tried in order and the first match wins, so a
+bare `"*"` route must be last.
+
+`auth` is one of:
+
+| Value | Sends |
+|---|---|
+| `passthrough` | The caller's own credential, untouched. Use only for a route you trust with your subscription. |
+| `bearer:env:VAR` | `Authorization: Bearer $VAR` |
+| `bearer:keychain:<service>/<account>` | A credential read once at startup from the macOS login keychain. A missing entry is a startup error, not a silent 401. |
+| `x-api-key:env:VAR` | `x-api-key: $VAR` instead of `Authorization` |
+| `none` | No credential |
+
+Per-route options:
+
+| Key | Meaning |
+|---|---|
+| `model_rewrite` | Map applied to the body's `model` field for that route. The only case where the body is re-serialized; every other route forwards the original bytes. |
+| `fallback` | Ordered list of model ids to try when the upstream returns a status in `fallback_status_codes` and no response byte has reached the client. **Absent** inherits `default_fallback`. **Present and empty** (`[]`) means never fall back, fail loud. The two differ on purpose, so an explicit opt-out is never re-enabled. Each entry is re-resolved from the top of the route table, and no id is tried twice per request. |
+| `subscription` | A fixed "which subscription pays" label. `check` and `models` print it with no upstream lookup. The only way to answer for a `passthrough` route. |
+| `models` | Fixed model ids the picker's create wizard offers for that `subscription`. Without it the wizard shows one unselectable explanatory line. |
+
+### Top-level options
+
+| Key | Meaning |
+|---|---|
+| `listen` | Address to bind. A change needs a restart. |
+| `max_body_bytes` | Request body cap. |
+| `default_fallback` | Chain for any route with no `fallback` key. Applies to every request, including the main-loop session. |
+| `fallback_status_codes` | Statuses that trigger a fallback. Default `429, 402, 403, 500, 502, 503, 529`. |
+| `cooldown_default_seconds` | How long an id that triggered a fallback is skipped (default `300`), unless the upstream's `Retry-After` says otherwise. In memory only, reset on restart. |
+| `subscriptions` | Map from an upstream `/v1/models` `owned_by` value to a subscription name. An unmapped `owned_by` prints raw, tagged `(unmapped)`. |
+| `subscription_overrides` | Ordered `{"match": "<glob>", "subscription": "<name>"}` list checked before `subscriptions`. Corrects aggregators whose `owned_by` names the wire protocol, not the payer. |
+| `subscription_probes` | List of `{"subscription", "model", "fallback", "skip_model_probe"}` entries. `model` is the cheap id the launch guard and picker probe to decide whether that subscription is alive. `fallback` names the subscription the picker offers (after a confirm prompt) when it has ended. `skip_model_probe: true` stops per-model probing when its list opens; set it where every request is billed. |
+| `no_model_route` | Route (by its `match`) for requests with no `model` field or a non-JSON body. These are Anthropic control calls, not completions. Absent means the first `passthrough` route, or the `"*"` route if none. An unknown value fails config load and lists the valid matches. Such requests log as `model="" (no-model -> <glob>)`. |
 
 ### Fallback visibility
 
-A silent substitution would mean reading output believing it came from the
-model you asked for. Every fallback announces itself in three places: a
-`⚠ FELL BACK <from> → <to> (...)` line in the server log (and
-`✗ CHAIN EXHAUSTED <requested> → [...]` if every hop fails), the response's
-`model` field (and, for a streaming response, the `message_start` event's
-`message.model`) rewritten to the model that actually answered, and an
-`x-submux-fallback: <full chain>` response header. Once any response byte
-has reached the client, submux never retries — a partial answer is never
-spliced with a second model's output.
+If you do configure a fallback, it announces itself in three places:
 
-## Run
+1. The server log: `⚠ FELL BACK <from> → <to> (...)`, and
+   `✗ CHAIN EXHAUSTED <requested> → [...]` if every hop fails.
+2. The response's `model` field (and a streaming `message_start` event's
+   `message.model`), rewritten to the model that actually answered.
+3. An `x-submux-fallback: <full chain>` response header.
+
+Once any response byte has reached the client, submux never retries, so a
+partial answer is never spliced with a second model's output.
+
+## Commands
 
 ```sh
 submux serve [--config PATH] [--listen ADDR] [--debug-headers]
-submux routes [--config PATH]           # print the resolved route table
-submux check <model-id> [--config PATH] # route, upstream and PAYING subscription for an id
-submux models [--config PATH]           # every servable id, grouped by paying subscription
-submux status [--config PATH] [--listen ADDR] # cooling ids + last 20 fallbacks
+submux routes [--config PATH]                  # resolved route table
+submux check <model-id> [--config PATH]        # route, upstream and paying subscription
+submux models [--config PATH]                  # every servable id, grouped by subscription
+submux status [--config PATH] [--listen ADDR]  # cooling ids and last 20 fallbacks
+submux pick [--out FILE]                       # interactive setup picker
+submux statusline                              # status line for Claude Code (reads stdin JSON)
 ```
 
-`submux check <model-id>` answers "which subscription actually pays for
-this" (§2 above), not just which route matches: for a route with no fixed
-`subscription` label it makes ONE upstream `/v1/models` call to look up the
-id's real `owned_by`, applies `subscription_overrides` then `subscriptions`,
-and prints the raw `owned_by` alongside the mapped name so a wrong mapping
-can never hide. An id absent from that upstream's catalogue prints
-`NOT SERVED` plus up to 5 near-miss suggestions and exits 1 (catch a typo'd
-id before a session launches on it); an unreachable upstream or missing
-credential prints `UNKNOWN` and exits 2.
+- **`check`** makes one upstream `/v1/models` call for a route with no fixed
+  `subscription`, applies `subscription_overrides` then `subscriptions`, and
+  prints the raw `owned_by` next to the mapped name. An id missing from the
+  catalogue prints `NOT SERVED` plus up to 5 near-miss suggestions and exits 1.
+  An unreachable upstream or missing credential prints `UNKNOWN` and exits 2.
+- **`models`** fetches each non-fixed-label catalogue once and answers "what can
+  I use today" in one line per subscription.
+- **`status`** queries the running server's admin endpoint (fallback state is
+  in that process's memory only). A fresh server prints `cooling: none` and
+  `recent fallbacks: none`.
 
-`submux models` fetches every non-fixed-label route's catalogue once and
-groups ids by resolved subscription, answering "what can I use today" in
-one line per subscription.
-
-`submux status` queries a running `submux serve` process's admin endpoint
-(fallback state lives in that process's memory only, never on disk), and
-prints which model ids are currently cooling and the last 20 fallback
-events. Run it against a fresh server with no fallbacks yet and it prints
-`cooling: none` / `recent fallbacks: none`.
-
-## Launch Claude Code through it
+## Launcher and picker
 
 ```sh
 bin/submux-claude --fable <id> --opus <id> --sonnet <id> --haiku <id> [--port N] [-- <claude args>]
 ```
 
-Every tier flag is optional; an omitted tier is left unset so Claude Code
-falls back to its own default for that tier. The launcher unsets
-`ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (they suppress the OAuth bearer
-this tool depends on), starts `submux serve` if nothing is already
-listening on the configured port, exports `ANTHROPIC_BASE_URL` and the four
-tier env vars, and execs `claude`.
+Every tier flag is optional; an omitted tier is left unset so Claude Code uses
+its own default. The launcher unsets `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` (they suppress the OAuth bearer), starts `submux serve`
+if nothing listens on the port, exports `ANTHROPIC_BASE_URL` and the four tier
+variables, and execs `claude`. A script that passes explicit tier flags skips
+the picker entirely.
 
-### Interactive picker: no flags
+With no tier flags it launches `submux pick`: a full-screen picker (rendered to
+`/dev/tty`, never stdout) with your saved setups sorted most-used-first, or a
+create wizard where every step is pick-a-subscription then pick-a-model, with
+no id typing.
 
-Run `bin/submux-claude` with **no** `--fable`/`--opus`/`--sonnet`/`--haiku`
-flags and it launches `submux pick` instead of requiring you to type ids: a
-full-screen picker (rendered to `/dev/tty`, never stdout) offering your
-saved setups sorted most-used-first, or a "create a new setup" wizard where
-every step is a pick-a-subscription-then-pick-a-model list -- no id typing
-anywhere. A script that already passes explicit tier flags is completely
-unaffected; that path is untouched.
+| File | Holds |
+|---|---|
+| `~/.config/submux/profiles.json` | Saved setups: name, models, effort, uses, last used, alias |
+| `~/.config/submux/models-cache.json` | Live model list (ids and `owned_by` only, no credential), refreshed after 10 minutes |
+| `~/.local/state/submux/submux.log` | Relay log when started by the launcher |
 
-Saved setups live in `~/.config/submux/profiles.json`; a live model-list
-cache (ids and their `owned_by` label only, no credential) lives in
-`~/.config/submux/models-cache.json`, refreshed after 10 minutes. Both
-degrade gracefully if missing or corrupt -- you start with an empty history
-rather than a crash. Run `submux pick --out <file>` directly to inspect the
-`SUBMUX_MAIN`/`SUBMUX_FABLE`/`SUBMUX_OPUS`/`SUBMUX_SONNET`/`SUBMUX_HAIKU`/
-`SUBMUX_PROFILE` lines it writes.
+Missing or corrupt files degrade to an empty history, not a crash. Run
+`submux pick --out <file>` to inspect the `SUBMUX_MAIN`, `SUBMUX_FABLE`,
+`SUBMUX_OPUS`, `SUBMUX_SONNET`, `SUBMUX_HAIKU` and `SUBMUX_PROFILE` lines it
+writes.
 
-### Everyday use: `sc`
+## Troubleshooting
 
-`bin/sc` (symlink it onto PATH) is the short front door. Plain `sc` relaunches
-the last setup; `sc -p` opens the picker; `sc sol` launches the saved setup
-whose alias, name or main model matches "sol" (most recently used wins when
-several match); `sc -l` lists setups; `sc --alias NAME ALIAS` (or `a` in the picker) names one.
-Anything after the word goes to `claude`.
+| Symptom | Likely cause and fix |
+|---|---|
+| Launch refused with a login or 401/403 message | The upstream login expired. Re-login in your aggregator (for Codex via cliproxy: `cliproxyapi -codex-login`), then retry. |
+| Launch refused with a bare 502 | Often exhausted quota behind the aggregator. Read the aggregator's own log for the real reason. |
+| A model is greyed in the picker | The probe found its subscription down or out of quota. The reason is shown on the row; press `r` to re-probe. |
+| Answers come from a different model than you picked | A fallback is configured. Set `default_fallback` and every route `fallback` to `[]`. The status line and `x-submux-fallback` header show the real model. |
+| Startup feels slow | The launch guard's probe is capped at 6s and cached for 5 minutes. Check `sc` output for a timeout warning. |
+| Config edit has no effect | A bad edit is logged and ignored. Check `~/.local/state/submux/submux.log`. A changed `listen` needs a restart. |
+| Port already in use | Another relay is running. `submux status` talks to it; `pkill -x submux` stops it. |
+| Status line missing | You have your own `statusLine`, or `SUBMUX_NO_STATUSLINE=1` is set. |
 
-- **No silent fallbacks.** Keep `default_fallback` and per-route `fallback` at
-  `[]`: a failing model then returns its real error instead of another model
-  answering under the picked name.
-- **Launch guard.** Before `claude` starts, the main model gets a 1-token probe
-  (6s cap, pass cached 5 min). A dead login or exhausted quota refuses the
-  launch, or sends you back to the picker when you chose from it.
-  `SUBMUX_SKIP_PREFLIGHT=1` skips it.
-- **Picker.** Models whose subscription is down or out of quota are greyed
-  with the reason; per-model probes grey single dead models. Enter on a dead
-  subscription asks before opening its configured free fallback.
-- **Status line.** The launcher adds a status line (`submux statusline`) that
-  shows the model the relay really sent the request to, per session, and turns
-  loud on an error or a fallback. Skipped when you have your own `statusLine`;
-  `SUBMUX_NO_STATUSLINE=1` turns it off.
-- **Hot reload.** `serve` re-reads `config.json` within 2s of a change (or on
-  `SIGHUP`); a bad edit is logged and ignored. A changed `listen` needs a restart.
-- **Launch warnings.** A cliproxy login that stopped refreshing, and `--resume`
-  or `--continue`, print a warning and continue.
+## Limits and caveats
 
-## Caveats
-
-- This relies on the current, **undocumented** behaviour of Claude Code's
+- This relies on the current, **undocumented** behavior of Claude Code's
   subscription OAuth flow (which headers it sends when, and how the four
   `ANTHROPIC_DEFAULT_*_MODEL` variables are read). It may change or stop
   working without notice in a future CLI release.
-- You are responsible for complying with your own provider(s)' terms of
-  service. submux does not modify, disguise, or rotate credentials; it only
-  routes requests you already asked the CLI to send.
-- Passthrough forwards your subscription credential to whatever upstream
-  that route names — only point a `passthrough` route at a provider you
-  trust with it.
+- You are responsible for complying with your provider's terms of service.
+  submux does not modify, disguise or rotate credentials; it only routes
+  requests you already asked the CLI to send.
+- Passthrough forwards your subscription credential to whatever upstream that
+  route names. Only point a `passthrough` route at a provider you trust with it.
+- Probes cost real (tiny) requests. Set `skip_model_probe` in `subscription_probes` for per-request billing.
