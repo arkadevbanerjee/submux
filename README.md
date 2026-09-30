@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/arkadevbanerjee/submux/actions/workflows/ci.yml/badge.svg)](https://github.com/arkadevbanerjee/submux/actions/workflows/ci.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/arkadevbanerjee/submux/badge)](https://scorecard.dev/viewer/?uri=github.com/arkadevbanerjee/submux)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15104/badge)](https://www.bestpractices.dev/projects/15104)
 [![Go Reference](https://pkg.go.dev/badge/github.com/arkadevbanerjee/submux.svg)](https://pkg.go.dev/github.com/arkadevbanerjee/submux)
 
 A local relay that lets one Claude Code session run its four subagent tiers
