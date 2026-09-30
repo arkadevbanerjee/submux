@@ -33,6 +33,8 @@ type probeResult struct {
 
 const probeTimeout = 15 * time.Second
 
+var probeRetryDelay = 2 * time.Second
+
 // probeSubscription sends one 1-token Anthropic-format message for p.Model.
 func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 	res := probeResult{Subscription: p.Subscription, State: "unknown"}
@@ -68,14 +70,26 @@ func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 	case "x-api-key":
 		req.Header.Set("x-api-key", rt.authValue)
 	}
-	resp, err := (&http.Client{Timeout: probeTimeout}).Do(req)
-	if err != nil {
-		res.Detail = "probe failed: " + err.Error()
-		return res
+	var out probeResult
+	for attempt := range 2 {
+		if attempt > 0 {
+			time.Sleep(probeRetryDelay)
+			req = req.Clone(req.Context())
+			req.Body = io.NopCloser(bytes.NewReader([]byte(body)))
+		}
+		resp, err := (&http.Client{Timeout: probeTimeout}).Do(req)
+		if err != nil {
+			res.Detail = "probe failed: " + err.Error()
+			return res
+		}
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		out = classifyProbe(p.Subscription, resp.StatusCode, string(snippet))
+		if out.State != "down" { // only a 5xx is retried: one blip must not hide a live model
+			break
+		}
 	}
-	defer resp.Body.Close()
-	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	return classifyProbe(p.Subscription, resp.StatusCode, string(snippet))
+	return out
 }
 
 // classifyProbe maps an HTTP status and body to a probe state. cliproxy
@@ -90,11 +104,19 @@ func classifyProbe(sub string, status int, body string) probeResult {
 	case status == http.StatusPaymentRequired:
 		res.State, res.Detail = "ended", "payment required or credits exhausted (HTTP 402)"
 	case status == http.StatusUnauthorized || status == http.StatusForbidden ||
-		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid token"):
+		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "invalid_refresh_token"):
 		res.State, res.Detail = "ended", fmt.Sprintf("login expired or revoked (HTTP %d)", status)
 		if strings.Contains(lower, "subscription") {
 			res.Detail = fmt.Sprintf("active subscription required (HTTP %d)", status)
 		}
+	case strings.Contains(lower, "monthly_request_count") || strings.Contains(lower, "quota") ||
+		strings.Contains(lower, "reached the limit"):
+		res.State, res.Detail = "ended", fmt.Sprintf("quota exhausted (HTTP %d)", status)
+	case status >= 500:
+		// kirocc turns Kiro's quota error into a bare 502 "upstream API error", so a
+		// 5xx that survived probeSubscription's retry means the model cannot answer.
+		res.State, res.Detail = "down", fmt.Sprintf("HTTP %d %s", status, firstLine(body))
 	default:
 		res.State = "unknown"
 		res.Detail = fmt.Sprintf("HTTP %d %s", status, firstLine(body))
@@ -165,10 +187,13 @@ func applyProbes(cfg *config, catalog []subscriptionOption, results map[string]p
 	}
 	for i := range catalog {
 		r, ok := results[catalog[i].Name]
-		if !ok || r.State != "ended" {
+		if !ok || (r.State != "ended" && r.State != "down") {
 			continue
 		}
 		msg := "subscription ended or inactive: " + r.Detail
+		if r.State == "down" {
+			msg = "not answering right now: " + r.Detail
+		}
 		if fb := fallbacks[catalog[i].Name]; fb != "" {
 			msg += " · free fallback: " + fb
 		}

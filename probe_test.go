@@ -20,8 +20,11 @@ func TestClassifyProbe(t *testing.T) {
 		{402, "", "ended"},
 		{503, `auth_unavailable: last upstream error: unauthorized: Invalid token`, "ended"},
 		{429, "rate limited", "unknown"},
-		{500, "boom", "unknown"},
-		{502, "upstream API error", "unknown"},
+		{500, "boom", "down"},
+		{502, "upstream API error", "down"},
+		{400, `ServiceQuotaExceededException MONTHLY_REQUEST_COUNT You have reached the limit`, "ended"},
+		{503, `auth_unavailable ... "code": "invalid_refresh_token"`, "ended"},
+		{400, "bad request", "unknown"},
 	}
 	for _, c := range cases {
 		if got := classifyProbe("S", c.status, c.body).State; got != c.want {
@@ -107,3 +110,35 @@ func TestLoadConfigRejectsEmptyProbe(t *testing.T) {
 }
 
 func writeFileForTest(path, s string) error { return os.WriteFile(path, []byte(s), 0o600) }
+
+func TestProbeRetriesOne5xxThenSucceeds(t *testing.T) {
+	probeRetryDelay = 0
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(502)
+			return
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	cfg := &config{Routes: []route{{match: "*", upstream: srv.URL, authKind: "none"}}}
+	r := probeSubscription(cfg, subscriptionProbe{Subscription: "S", Model: "m"})
+	if r.State != "ok" || calls != 2 {
+		t.Fatalf("one 5xx blip = %+v after %d calls, want ok after 2", r, calls)
+	}
+}
+
+func TestApplyProbesHidesDownAndEnded(t *testing.T) {
+	cfg := &config{}
+	catalog := []subscriptionOption{{Name: "A"}, {Name: "B"}, {Name: "C"}}
+	applyProbes(cfg, catalog, map[string]probeResult{
+		"A": {State: "down", Detail: "HTTP 502"},
+		"B": {State: "ended", Detail: "quota exhausted (HTTP 400)"},
+		"C": {State: "unknown"},
+	})
+	if !strings.Contains(catalog[0].Unavailable, "not answering") || !strings.Contains(catalog[1].Unavailable, "quota") || catalog[2].Unavailable != "" {
+		t.Fatalf("unavailable marks = %q / %q / %q", catalog[0].Unavailable, catalog[1].Unavailable, catalog[2].Unavailable)
+	}
+}

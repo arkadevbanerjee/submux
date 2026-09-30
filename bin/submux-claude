@@ -153,6 +153,29 @@ if ! nc -z 127.0.0.1 "$PORT" >/dev/null 2>&1; then
   done
 fi
 
+# Step 2b: refuse to launch on a dead upstream. A picked model whose provider login has
+# expired (cliproxy 503 auth_unavailable) used to fall back to another model silently
+# while the screen kept showing the picked name. Probe each non-Claude id with a
+# 1-token request; any non-200 aborts with the upstream's own message.
+# Skip with SUBMUX_SKIP_PREFLIGHT=1.
+if [ -z "${SUBMUX_SKIP_PREFLIGHT:-}" ]; then
+  for id in $(printf '%s\n' "$MAIN_ID" "$FABLE_ID" "$OPUS_ID" "$SONNET_ID" "$HAIKU_ID" | sort -u); do
+    case "$id" in "" | claude-*) continue ;; esac
+    probe_id="${id%\[1m\]}"
+    body="$(jq -nc --arg m "$probe_id" '{model:$m,max_tokens:1,messages:[{role:"user",content:"hi"}]}')"
+    out="$(curl -s -m 40 -o - -w '\n%{http_code}' "http://127.0.0.1:$PORT/v1/messages" \
+      -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+      -H "X-Claude-Code-Session-Id: $(uuidgen)" -d "$body" 2>/dev/null || true)"
+    code="$(printf '%s' "$out" | tail -n1)"
+    if [ "$code" != "200" ]; then
+      msg="$(printf '%s' "$out" | sed '$d' | jq -r '.error.message // empty' 2>/dev/null | cut -c1-300)"
+      echo "submux-claude: REFUSING TO LAUNCH: model '$id' is unavailable (HTTP ${code:-none}): ${msg:-no response}" >&2
+      echo "submux-claude: fix the provider login, or override with SUBMUX_SKIP_PREFLIGHT=1" >&2
+      exit 1
+    fi
+  done
+fi
+
 # Step 3
 export ANTHROPIC_BASE_URL="http://127.0.0.1:$PORT"
 # A custom base URL turns off deferred tool loading, so every MCP/deferred tool schema

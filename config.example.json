@@ -1,7 +1,7 @@
 {
   "listen": "127.0.0.1:8787",
   "max_body_bytes": 67108864,
-  "default_fallback": ["glm-5.3", "gpt-5.6-luna", "grok-4.6"],
+  "default_fallback": [],
   "fallback_status_codes": [429, 402, 403, 500, 502, 503, 529],
   "cooldown_default_seconds": 300,
   "routes": [
