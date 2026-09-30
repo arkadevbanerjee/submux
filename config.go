@@ -33,6 +33,9 @@ type rawConfig struct {
 	// subscription pays for this" existed. See subs.go.
 	Subscriptions         map[string]string         `json:"subscriptions,omitempty"`
 	SubscriptionOverrides []rawSubscriptionOverride `json:"subscription_overrides,omitempty"`
+	// SubscriptionProbes (optional) lists one cheap model per subscription the
+	// picker test-chats to detect an ended plan. See probe.go.
+	SubscriptionProbes []subscriptionProbe `json:"subscription_probes,omitempty"`
 }
 
 type rawRoute struct {
@@ -79,6 +82,8 @@ type config struct {
 	Subscriptions map[string]string
 	// SubscriptionOverrides is evaluated, in order, BEFORE Subscriptions.
 	SubscriptionOverrides []subscriptionOverride
+	// SubscriptionProbes drives the picker's ended-subscription check.
+	SubscriptionProbes []subscriptionProbe
 
 	// NoModelRoute is the route a request with no "model" field (or a
 	// non-JSON body) is sent to, resolved once at load time. nil means no
@@ -134,6 +139,12 @@ func loadConfig(path string) (*config, error) {
 	}
 
 	cfg.Subscriptions = raw.Subscriptions
+	for i, sp := range raw.SubscriptionProbes {
+		if sp.Subscription == "" || sp.Model == "" {
+			return nil, fmt.Errorf("config %s: subscription_probes[%d]: subscription and model must not be empty", path, i)
+		}
+	}
+	cfg.SubscriptionProbes = raw.SubscriptionProbes
 	for i, ov := range raw.SubscriptionOverrides {
 		if ov.Match == "" {
 			return nil, fmt.Errorf("config %s: subscription_overrides[%d]: match must not be empty", path, i)

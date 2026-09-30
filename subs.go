@@ -50,6 +50,10 @@ type subscriptionResult struct {
 type upstreamModel struct {
 	ID      string `json:"id"`
 	OwnedBy string `json:"owned_by"`
+	// MaxInputTokens is Anthropic's context window for the id (absent on
+	// OpenAI-style catalogues); >= oneMillionTokens means Claude Code can also
+	// run it as "<id>[1m]".
+	MaxInputTokens int `json:"max_input_tokens,omitempty"`
 }
 
 type upstreamModelsResponse struct {
@@ -118,7 +122,7 @@ func subscriptionNameForOwnedBy(cfg *config, modelID, ownedBy string) (name, evi
 	if mapped, ok := cfg.Subscriptions[ownedBy]; ok {
 		return mapped, fmt.Sprintf("upstream /v1/models owned_by=%q", ownedBy)
 	}
-	return fmt.Sprintf("%s (unmapped)", ownedBy),
+	return fmt.Sprintf("Other: provider %q, no name configured", ownedBy),
 		fmt.Sprintf("upstream /v1/models owned_by=%q, no subscriptions mapping configured", ownedBy)
 }
 

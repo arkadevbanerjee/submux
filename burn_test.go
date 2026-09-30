@@ -182,8 +182,8 @@ func TestBurnCellProvider(t *testing.T) {
 	}
 }
 
-// §S7 measured state: same bar, "(measured)" suffix, plus the hardcoded
-// Anthropic notes (§S6).
+// Measured rows are token ratios, not multipliers: no number is shown, but the
+// hardcoded Anthropic notes (§S6) still are.
 func TestBurnCellMeasured(t *testing.T) {
 	m := pickModel{burn: burnFile{Providers: map[string]map[string]burnEntry{
 		"Claude Max": {
@@ -192,15 +192,15 @@ func TestBurnCellMeasured(t *testing.T) {
 		},
 	}}}
 	f := m.burnCell("Claude Max", "claude-fable-5")
-	if !strings.Contains(f, "~3.5x (measured)") {
-		t.Errorf("measured cell = %q, want ~3.5x (measured)", f)
+	if !strings.Contains(f, "not disclosed") || strings.Contains(f, "3.5x") {
+		t.Errorf("measured cell = %q, want not disclosed and no number", f)
 	}
 	if !strings.Contains(f, "⚠ 50% wk cap") {
 		t.Errorf("measured cell = %q, want the fable weekly-cap note", f)
 	}
 	h := m.burnCell("Claude Max", "claude-haiku-4-5")
-	if !strings.Contains(h, "(measured)") || !strings.Contains(h, "(effort ignored)") {
-		t.Errorf("measured haiku cell = %q, want (measured) and (effort ignored)", h)
+	if !strings.Contains(h, "not disclosed") || !strings.Contains(h, "(effort ignored)") {
+		t.Errorf("measured haiku cell = %q, want not disclosed and (effort ignored)", h)
 	}
 }
 

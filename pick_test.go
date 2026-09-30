@@ -130,11 +130,10 @@ func TestRefreshKeyTriggersUpstreamRefetch(t *testing.T) {
 	// fetches and ccusage alongside it.
 	m.burnRefreshChecked = true
 	m.cacheEntries = entries
-	m.catalog = buildSubscriptionCatalog(cfg, entries, time.Now())
+	// Seed the stale-flagged row directly: buildSubscriptionCatalog now
+	// re-fetches a stale entry itself, which would count as a hit here.
+	m.catalog = []subscriptionOption{{Name: "xai (unmapped)", ModelIDs: []string{"stale-id"}, CacheAge: "3h ago", Upstreams: []string{url}}}
 	m.subCursor = 0
-	if len(m.catalog) == 0 {
-		t.Fatalf("setup: expected at least one catalog entry")
-	}
 	if m.catalog[0].CacheAge == "" {
 		t.Fatalf("setup: expected the seeded stale entry to be flagged, catalog=%+v", m.catalog)
 	}
@@ -227,5 +226,61 @@ func TestExpandedRowShowsPayerForSetSlot(t *testing.T) {
 	}
 	if !strings.Contains(view, "(session default)") {
 		t.Fatalf("unset slot missing the '(session default)' label; full view:\n%s", view)
+	}
+}
+
+// Raw float ratios (1.344887382, 13063.378845) render at a readable precision.
+func TestFormatBurnWeight(t *testing.T) {
+	for _, tc := range []struct {
+		in   float64
+		want string
+	}{
+		{1, "1"}, {1.344887382, "1.3"}, {2.3333333, "2.3"}, {9.96, "10"}, {10.4, "10"}, {2746.4001588584106, "2746"}, {13063.378845354988, "13063"},
+	} {
+		if got := formatBurnWeight(tc.in); got != tc.want {
+			t.Errorf("formatBurnWeight(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ctrl+r on the model pane refreshes the highlighted subscription (plain 'r'
+// there is a filter character), and the outcome shows in the status bar even
+// when nothing changed upstream.
+func TestCtrlRRefreshesOnModelPaneAndReportsOutcome(t *testing.T) {
+	url, hits := modelsServer(t, []upstreamModel{{ID: "fresh-id", OwnedBy: "xai"}})
+	cfg := &config{Routes: []route{{match: "*", upstream: url, authKind: "none"}}}
+	m := newPickModel(cfg, "/tmp/x-profiles.json", "/tmp/x-cache.json", "", nil, "")
+	m.mode = modeWizModel
+	m.burnRefreshChecked = true
+	m.cacheEntries = map[string]cacheEntry{url: {FetchedAt: time.Now(), Models: []cachedModel{{ID: "fresh-id", OwnedBy: "xai"}}}}
+	m.catalog = []subscriptionOption{{Name: "xai (unmapped)", ModelIDs: []string{"fresh-id"}, Upstreams: []string{url}}}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	next := updated.(pickModel)
+	if cmd == nil || !next.refreshing {
+		t.Fatalf("ctrl+r on the model pane: cmd=%v refreshing=%v, want a refresh in flight", cmd != nil, next.refreshing)
+	}
+	pending := []tea.Cmd{cmd}
+	for len(pending) > 0 {
+		c := pending[0]
+		pending = pending[1:]
+		if c == nil {
+			continue
+		}
+		msg := c()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			pending = append(pending, batch...)
+			continue
+		}
+		var nc tea.Cmd
+		updated, nc = next.Update(msg)
+		next = updated.(pickModel)
+		pending = append(pending, nc)
+	}
+	if *hits < 1 {
+		t.Fatalf("ctrl+r: upstream got %d request(s), want >= 1", *hits)
+	}
+	if !strings.Contains(next.statusBar(), "refreshed xai (unmapped)") {
+		t.Fatalf("status bar = %q, want a 'refreshed ...' outcome even with no change", next.statusBar())
 	}
 }

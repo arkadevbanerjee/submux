@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,9 +21,14 @@ import (
 // (spec §2.5).
 const modelsCacheFreshFor = 10 * time.Minute
 
+// oneMillionTokens is the context window at which Claude Code offers the
+// "[1m]" variant of an Anthropic id.
+const oneMillionTokens = 1_000_000
+
 type cachedModel struct {
-	ID      string `json:"id"`
-	OwnedBy string `json:"owned_by"`
+	ID             string `json:"id"`
+	OwnedBy        string `json:"owned_by"`
+	MaxInputTokens int    `json:"max_input_tokens,omitempty"`
 }
 
 type cacheEntry struct {
@@ -122,6 +128,15 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 		}
 		byGroup := map[string][]string{}
 		for _, m := range models {
+			if !isPickableModelID(m.ID) {
+				continue
+			}
+			// The relay routes by id: an id another route claims (Antigravity's
+			// "claude-sonnet-4-6" is served by the claude-* route, i.e. Claude
+			// Max) can never reach this upstream under that id.
+			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.upstream != rt.upstream {
+				continue
+			}
 			// A fixed-label route (claude-*) names its payer outright; only
 			// the model list itself comes from the upstream.
 			name := rt.subscription
@@ -129,6 +144,9 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 				name, _ = subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
 			}
 			byGroup[name] = append(byGroup[name], m.ID)
+			if m.MaxInputTokens >= oneMillionTokens {
+				byGroup[name] = append(byGroup[name], m.ID+"[1m]")
+			}
 		}
 		names := make([]string, 0, len(byGroup))
 		for n := range byGroup {
@@ -155,6 +173,31 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 	return out
 }
 
+// nonCodingMarkers are substrings that mark an id as an image, video, audio
+// or embedding model. submux launches Claude Code, which cannot drive them,
+// so they never belong in the picker.
+var nonCodingMarkers = []string{
+	"image", "imagine", "video", "audio", "tts", "whisper", "speech",
+	"transcribe", "realtime", "embed", "rerank", "moderation", "dall-e", "sora",
+	"auto-review", // codex-auto-review: Codex's internal reviewer, not a coding tier
+}
+
+// isPickableModelID reports whether id can serve as a Claude Code tier: it
+// drops non-coding modalities and the "kiro/kiro/..." alias kirocc leaks into
+// its catalogue from the advisor model mapping (the real id is "kiro/...").
+func isPickableModelID(id string) bool {
+	lower := strings.ToLower(id)
+	if strings.HasPrefix(lower, "kiro/kiro/") {
+		return false
+	}
+	for _, marker := range nonCodingMarkers {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return true
+}
+
 // routeUnavailableName labels a subscription bucket that could not be
 // resolved at all (upstream unreachable, no cache) so it still shows up in
 // the list rather than silently vanishing (spec §2.4 "the wizard stays
@@ -168,15 +211,20 @@ func routeUnavailableName(rt route) string {
 // its age), and only hitting the network when there is no usable cache at
 // all. entries is updated in place on a successful fetch.
 func modelsForRoute(cfg *config, rt route, entries map[string]cacheEntry, now time.Time) ([]cachedModel, string, error) {
-	if e, ok := entries[rt.upstream]; ok {
-		age := now.Sub(e.FetchedAt)
-		if age < modelsCacheFreshFor {
-			return e.Models, "", nil
+	stale, haveStale := entries[rt.upstream]
+	if haveStale {
+		if now.Sub(stale.FetchedAt) < modelsCacheFreshFor {
+			return stale.Models, "", nil
 		}
-		// Stale but present: used IMMEDIATELY, no network call, per §2.5 --
-		// "a spinner on every keystroke is not nice". A manual refresh is a
-		// distinct, explicit action ('r'), not implied by staleness.
-		return e.Models, relativeTime(e.FetchedAt.Format(time.RFC3339), now), nil
+		// Past the freshness window: re-fetch once when the catalog is built
+		// (once per picker session, never per keystroke). A failed fetch falls
+		// back to the stale entry, flagged with its age, so the list never blanks.
+		fresh, err := fetchAndConvert(rt)
+		if err != nil {
+			return stale.Models, relativeTime(stale.FetchedAt.Format(time.RFC3339), now), nil
+		}
+		entries[rt.upstream] = cacheEntry{FetchedAt: now, Models: fresh}
+		return fresh, "", nil
 	}
 
 	fresh, err := fetchAndConvert(rt)
@@ -197,7 +245,7 @@ func fetchAndConvert(rt route) ([]cachedModel, error) {
 	}
 	out := make([]cachedModel, 0, len(models))
 	for _, m := range models {
-		out = append(out, cachedModel{ID: m.ID, OwnedBy: m.OwnedBy})
+		out = append(out, cachedModel{ID: m.ID, OwnedBy: m.OwnedBy, MaxInputTokens: m.MaxInputTokens})
 	}
 	return out, nil
 }

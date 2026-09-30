@@ -186,6 +186,8 @@ type pickModel struct {
 	catalog      []subscriptionOption
 	cacheEntries map[string]cacheEntry
 	catalogWarn  string
+	probes       map[string]probeResult // subscription -> latest probe, re-applied after every catalog rebuild
+	probesSent   bool                   // ONE background probe batch per picker session
 
 	burn               burnFile // loaded from disk by ensureCatalog, merged by burnRefreshMsg (§S8)
 	burnRefreshChecked bool     // ONE background burn refresh per picker session, never blocking
@@ -195,6 +197,7 @@ type pickModel struct {
 	refreshing    bool   // a manual 'r' refresh (DEFECT 1, round 2) is in flight
 	refreshTarget string // subscription Name being refreshed
 	refreshErr    string // last refresh failure, surfaced in the status bar until the next refresh
+	refreshNote   string // last refresh's outcome ("refreshed X: n ids, +a new, -b gone"), so an unchanged list still shows the key worked
 
 	wizStep      int
 	wizPicks     [5]string
@@ -279,6 +282,7 @@ func (m *pickModel) ensureCatalog() tea.Cmd {
 	if m.catalog == nil {
 		entries := loadModelsCache(m.cachePath)
 		m.catalog = buildSubscriptionCatalog(m.cfg, entries, m.now)
+		applyProbes(m.cfg, m.catalog, m.probes)
 		m.cacheEntries = entries
 		if err := saveModelsCache(m.cachePath, entries); err != nil {
 			m.catalogWarn = fmt.Sprintf("could not write models cache: %v", err)
@@ -295,6 +299,10 @@ func (m *pickModel) ensureCatalog() tea.Cmd {
 		if providers || measured {
 			cmd = refreshBurnCmd(m.cfg, m.cacheEntries, m.burn, providers, measured)
 		}
+	}
+	if !m.probesSent {
+		m.probesSent = true
+		cmd = tea.Batch(cmd, probeCmd(m.cfg))
 	}
 	return cmd
 }
@@ -325,6 +333,18 @@ func (m pickModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case refreshResultMsg:
 		return m.applyRefreshResult(msg), nil
+	case probeResultsMsg:
+		if m.probes == nil {
+			m.probes = map[string]probeResult{}
+		}
+		for _, r := range msg.results {
+			m.probes[r.Subscription] = r
+		}
+		if m.catalog != nil {
+			m.catalog = buildSubscriptionCatalog(m.cfg, m.cacheEntries, time.Now())
+			applyProbes(m.cfg, m.catalog, m.probes)
+		}
+		return m, nil
 	case burnRefreshMsg:
 		// §S8: msg.burn always started from the previous file, so even a
 		// failed refresh keeps the stale data already on screen; the error
@@ -346,7 +366,9 @@ func (m pickModel) applyRefreshResult(msg refreshResultMsg) pickModel {
 	if m.cacheEntries == nil {
 		m.cacheEntries = map[string]cacheEntry{}
 	}
+	added, gone := 0, 0
 	for up, entry := range msg.upstreams {
+		added, gone = added+countNewIDs(entry.Models, m.cacheEntries[up].Models), gone+countNewIDs(m.cacheEntries[up].Models, entry.Models)
 		m.cacheEntries[up] = entry
 	}
 	if len(msg.upstreams) > 0 {
@@ -354,6 +376,7 @@ func (m pickModel) applyRefreshResult(msg refreshResultMsg) pickModel {
 			m.catalogWarn = fmt.Sprintf("could not write models cache: %v", err)
 		}
 		m.catalog = buildSubscriptionCatalog(m.cfg, m.cacheEntries, time.Now())
+		applyProbes(m.cfg, m.catalog, m.probes)
 	}
 	if len(msg.failedUpstreams) > 0 {
 		errText := "refresh failed"
@@ -363,6 +386,7 @@ func (m pickModel) applyRefreshResult(msg refreshResultMsg) pickModel {
 		m.refreshErr = fmt.Sprintf("refresh of %s failed (%s) -- showing cached data", msg.subName, errText)
 	} else {
 		m.refreshErr = ""
+		m.refreshNote = fmt.Sprintf("refreshed %s at %s: +%d new, -%d gone upstream", msg.subName, time.Now().Format("15:04:05"), added, gone)
 	}
 	for i, opt := range m.catalog {
 		if opt.Name == msg.subName {
@@ -371,6 +395,41 @@ func (m pickModel) applyRefreshResult(msg refreshResultMsg) pickModel {
 		}
 	}
 	return m
+}
+
+// countNewIDs counts ids in next that are absent from prev.
+func countNewIDs(next, prev []cachedModel) int {
+	had := make(map[string]bool, len(prev))
+	for _, p := range prev {
+		had[p.ID] = true
+	}
+	n := 0
+	for _, x := range next {
+		if !had[x.ID] {
+			n++
+		}
+	}
+	return n
+}
+
+// startRefresh re-fetches the upstream(s) behind the highlighted subscription
+// (the 'r' key on the subscription pane, ctrl+r on the model pane). It returns
+// the model unchanged and a nil cmd when there is nothing to refresh or a
+// refresh is already in flight.
+func (m pickModel) startRefresh() (pickModel, tea.Cmd) {
+	if m.refreshing || m.subCursor >= len(m.catalog) {
+		return m, nil
+	}
+	opt := m.catalog[m.subCursor]
+	if len(opt.Upstreams) == 0 {
+		return m, nil
+	}
+	m.refreshing = true
+	m.refreshTarget = opt.Name
+	m.refreshErr = ""
+	m.refreshNote = ""
+	// Re-probe too: a renewed plan should come back without restarting the picker.
+	return m, tea.Batch(m.spin.Tick, refreshSubscriptionCmd(m.cfg, opt.Name, opt.Upstreams), probeCmd(m.cfg, opt.Name))
 }
 
 func (m pickModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -453,14 +512,16 @@ func (m pickModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.filtering = true
 		m.filterInput.Focus()
 	case "n":
-		return m, m.startWizard()
+		cmd := m.startWizard()
+		return m, cmd
 	case "d":
 		if m.cursor < len(rows) {
 			m.deleteTarget = m.cursor
 		}
 	case "enter":
 		if m.cursor == newSetupIdx || len(rows) == 0 {
-			return m, m.startWizard()
+			cmd := m.startWizard()
+			return m, cmd
 		}
 		chosen := rows[m.cursor]
 		m.profiles = touchProfile(m.profiles, chosen.Name, m.now)
@@ -516,17 +577,7 @@ func (m pickModel) updateWizSub(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// re-fetch this row's upstream(s) right now. No-op on a fixed-label
 		// route (Upstreams empty -- only the caller holds that OAuth) and
 		// while a refresh is already in flight.
-		if m.refreshing || m.subCursor >= len(m.catalog) {
-			return m, nil
-		}
-		opt := m.catalog[m.subCursor]
-		if len(opt.Upstreams) == 0 {
-			return m, nil
-		}
-		m.refreshing = true
-		m.refreshTarget = opt.Name
-		m.refreshErr = ""
-		return m, tea.Batch(m.spin.Tick, refreshSubscriptionCmd(m.cfg, opt.Name, opt.Upstreams))
+		return m.startRefresh()
 	case "esc":
 		if m.wizStep > 0 {
 			m.mode = modeWizModel
@@ -575,6 +626,11 @@ func (m pickModel) updateWizModel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeWizSub
 		m.modelFilter.Blur()
 		return m, nil
+	case "ctrl+r":
+		// Plain 'r' here is a filter character, so refresh gets its own chord.
+		next, cmd := m.startRefresh()
+		next.modelCursor = 0
+		return next, cmd
 	case "up", "ctrl+p":
 		if m.modelCursor > 0 {
 			m.modelCursor--
@@ -705,6 +761,9 @@ func autoName(picks [5]string) string {
 
 func shortToken(id string) string {
 	s := strings.ToLower(id)
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		s = s[i+1:] // drop the provider prefix ("kiro/", "zen/", "ogo/")
+	}
 	s = strings.TrimPrefix(s, "claude-")
 	segs := strings.Split(s, "-")
 	var out []string
@@ -808,6 +867,9 @@ func (m pickModel) statusBar() string {
 	}
 	if m.refreshErr != "" {
 		return base + "  ! " + m.refreshErr
+	}
+	if m.refreshNote != "" {
+		return base + "  " + m.refreshNote
 	}
 	if m.burnRefreshErr != "" {
 		return base + "  ! burn refresh failed -- showing cached burn data (" + m.burnRefreshErr + ")"
@@ -937,6 +999,16 @@ func burnBarLen(w float64) int {
 	return n
 }
 
+// formatBurnWeight prints a burn multiplier at a readable precision: one
+// decimal below 10x (trailing ".0" dropped), whole numbers from 10x up, so a
+// raw ratio like 1.344887382 shows as "1.3" and 2746.4001588 as "2746".
+func formatBurnWeight(w float64) string {
+	if w >= 10 {
+		return fmt.Sprintf("%.0f", w)
+	}
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", w), ".0")
+}
+
 // burnCell renders the bar + relative burn multiplier for one model id
 // under one provider (§S7). Weights are per-provider relative -- each
 // provider's lightest model is that screen's 1x, never one global scale. A
@@ -945,14 +1017,18 @@ func burnBarLen(w float64) int {
 // mistaken for a provider figure.
 func (m pickModel) burnCell(provider, id string) string {
 	e, ok := m.burnProviders()[provider][id]
-	if !ok || e.Source == "none" || e.Weight <= 0 {
-		return styleDim.Render("—  (not disclosed)")
+	// A measured row is a ccusage token ratio, not a cost multiplier (it
+	// produced "~13063x"), so it renders as not disclosed like a missing one.
+	// Its hardcoded note (weekly cap, effort ignored) still applies.
+	if !ok || e.Source == "none" || e.Source == "measured" || e.Weight <= 0 {
+		s := styleDim.Render("—  (not disclosed)")
+		if ok && e.Note != "" {
+			s += " " + e.Note
+		}
+		return s
 	}
 	bar := strings.Repeat("▇", burnBarLen(e.Weight))
-	s := fmt.Sprintf("%s  ~%gx", bar, e.Weight)
-	if e.Source == "measured" {
-		s += " (measured)"
-	}
+	s := fmt.Sprintf("%s  ~%sx", bar, formatBurnWeight(e.Weight))
 	if e.Note != "" {
 		s += " " + e.Note
 	}
@@ -1022,7 +1098,7 @@ func (m pickModel) viewWizModel() string {
 			fmt.Fprintln(&b, "  "+line)
 		}
 	}
-	fmt.Fprintln(&b, styleDim.Render("↑↓ move · type to filter · enter choose · esc back · q quit"))
+	fmt.Fprintln(&b, styleDim.Render("↑↓ move · type to filter · ctrl+r refresh · enter choose · esc back · q quit"))
 	return b.String()
 }
 

@@ -29,6 +29,8 @@ func main() {
 		cmdCheck(os.Args[2:])
 	case "models":
 		cmdModels(os.Args[2:])
+	case "probe":
+		cmdProbe(os.Args[2:])
 	case "status":
 		cmdStatus(os.Args[2:])
 	case "pick":
@@ -218,11 +220,20 @@ func cmdModels(args []string) {
 			continue
 		}
 		for _, m := range models {
+			if !isPickableModelID(m.ID) {
+				continue
+			}
+			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.upstream != rt.upstream {
+				continue
+			}
 			name := rt.subscription
 			if name == "" {
 				name, _ = subscriptionNameForOwnedBy(cfg, m.ID, m.OwnedBy)
 			}
 			buckets[name] = append(buckets[name], m.ID)
+			if m.MaxInputTokens >= oneMillionTokens {
+				buckets[name] = append(buckets[name], m.ID+"[1m]")
+			}
 		}
 	}
 
@@ -291,5 +302,33 @@ func cmdStatus(args []string) {
 		for _, f := range st.RecentFallbacks {
 			fmt.Printf("  %s  %s -> %v (%s)\n", f.At, f.Requested, f.Attempted, f.Outcome)
 		}
+	}
+}
+
+// cmdProbe runs every configured subscription probe and prints one line each,
+// the same check the picker runs on open.
+func cmdProbe(args []string) {
+	fs := flag.NewFlagSet("probe", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to config.json")
+	_ = fs.Parse(args)
+
+	path, err := resolveConfigPath(*configPath)
+	if err != nil {
+		log.Fatalf("submux: %v", err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		log.Fatalf("submux: %v", err)
+	}
+	if len(cfg.SubscriptionProbes) == 0 {
+		fmt.Println("no subscription_probes configured")
+		return
+	}
+	msg, ok := probeCmd(cfg)().(probeResultsMsg)
+	if !ok {
+		log.Fatalf("submux: probe returned no results")
+	}
+	for _, r := range msg.results {
+		fmt.Printf("%-32s %-8s %s\n", r.Subscription, r.State, r.Detail)
 	}
 }

@@ -72,8 +72,8 @@ func TestResolveSubscriptionOwnedByMapAndUnmapped(t *testing.T) {
 	}
 
 	unmapped := resolveSubscription(cfg, rt, "mystery-model")
-	if unmapped.Status != "resolved" || unmapped.Name != "mystery-vendor (unmapped)" {
-		t.Fatalf("resolveSubscription(mystery-model) = %+v, want raw owned_by + \"(unmapped)\"", unmapped)
+	if unmapped.Status != "resolved" || unmapped.Name != `Other: provider "mystery-vendor", no name configured` {
+		t.Fatalf("resolveSubscription(mystery-model) = %+v, want the 'Other: provider ...' label", unmapped)
 	}
 }
 
