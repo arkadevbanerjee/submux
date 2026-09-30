@@ -176,12 +176,12 @@ func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 			return nil, fmt.Errorf("GET %s: %w", base, err)
 		}
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return nil, fmt.Errorf("GET %s: status %d", base, resp.StatusCode)
 		}
 		var parsed upstreamModelsResponse
 		err = json.NewDecoder(resp.Body).Decode(&parsed)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("decode %s response: %w", base, err)
 		}

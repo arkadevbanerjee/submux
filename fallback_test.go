@@ -142,7 +142,7 @@ func TestNoFallbackAfterFirstByte(t *testing.T) {
 		flusher.Flush()
 		if hj, ok := w.(http.Hijacker); ok {
 			if conn, _, err := hj.Hijack(); err == nil {
-				conn.Close() // abrupt disconnect mid-stream, AFTER the first byte
+				_ = conn.Close() // abrupt disconnect mid-stream, AFTER the first byte
 			}
 		}
 	}))

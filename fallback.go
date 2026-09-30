@@ -266,7 +266,7 @@ func (s *server) modifyResponse(resp *http.Response) error {
 		s.cooldowns.markCooling(currentModel, until)
 
 		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		ac.lastTriggerStatus = resp.StatusCode
 		ac.lastTriggerHeader = resp.Header.Clone()
@@ -368,7 +368,7 @@ func rewriteResponseModel(resp *http.Response, actualModel string) error {
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<24))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if err != nil {
 		return err
 	}
@@ -543,7 +543,7 @@ func fetchStatus(addr string) (*statusResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reach submux serve at %s: %w", addr, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var st statusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		return nil, fmt.Errorf("decode status response: %w", err)

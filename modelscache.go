@@ -245,7 +245,7 @@ func fetchAndConvert(rt route) ([]cachedModel, error) {
 	}
 	out := make([]cachedModel, 0, len(models))
 	for _, m := range models {
-		out = append(out, cachedModel{ID: m.ID, OwnedBy: m.OwnedBy, MaxInputTokens: m.MaxInputTokens})
+		out = append(out, cachedModel(m))
 	}
 	return out, nil
 }

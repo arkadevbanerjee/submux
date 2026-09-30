@@ -101,14 +101,16 @@ func TestAtomicWriteFileLeavesNoPartialOnFailure(t *testing.T) {
 	if err := os.Chmod(dir, 0o500); err != nil {
 		t.Fatalf("chmod dir read-only: %v", err)
 	}
-	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
 	err := atomicWriteFile(path, []byte(`{"profiles":[{"name":"new-content"}]}`))
 	if err == nil {
 		t.Fatalf("atomicWriteFile: expected an error writing into a read-only dir")
 	}
 
-	os.Chmod(dir, 0o700)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod dir writable: %v", err)
+	}
 	got, readErr := os.ReadFile(path)
 	if readErr != nil {
 		t.Fatalf("read back original file: %v", readErr)
