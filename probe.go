@@ -21,6 +21,9 @@ type subscriptionProbe struct {
 	Subscription string `json:"subscription"`
 	Model        string `json:"model"`
 	Fallback     string `json:"fallback,omitempty"` // subscription to point at when this one has ended
+	// SkipModelProbe stops the picker from probing each of the subscription's models
+	// when its list opens: set it where every request is billed (Kiro).
+	SkipModelProbe bool `json:"skip_model_probe,omitempty"`
 }
 
 // probeResult is the outcome of one probe. State is "ok", "ended" (the
@@ -52,7 +55,7 @@ func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 		res.Detail = err.Error()
 		return res
 	}
-	model := p.Model
+	model := strings.TrimSuffix(p.Model, "[1m]")
 	if rewritten, ok := rt.modelRewrite[model]; ok {
 		model = rewritten
 	}
@@ -266,4 +269,14 @@ func modelBlocked(r probeResult, ok bool) (string, bool) {
 		return "not answering: " + r.Detail, true
 	}
 	return r.Detail, true
+}
+
+// skipModelProbe reports whether sub is configured to skip per-model probes.
+func skipModelProbe(cfg *config, sub string) bool {
+	for _, p := range cfg.SubscriptionProbes {
+		if p.Subscription == sub {
+			return p.SkipModelProbe
+		}
+	}
+	return false
 }

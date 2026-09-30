@@ -172,6 +172,7 @@ const (
 	modeWizModel
 	modeWizEffort
 	modeWizName
+	modeAlias       // 'a' in history: edit the alias of one saved setup
 	modeWizFallback // Enter on a dead subscription row: ask before pointing at its free fallback
 )
 
@@ -200,6 +201,7 @@ type pickModel struct {
 
 	modelProbes   map[string]map[string]probeResult // subscription -> model id -> per-model probe
 	modelProbedAt map[string]time.Time              // subscription -> when its models were last probed
+	aliasTarget   string                            // profile Name being aliased in modeAlias
 	notice        string                            // one-line reason shown under the list (why Enter did nothing)
 	fbTo          int                               // catalog index of the fallback offered in modeWizFallback
 
@@ -278,7 +280,7 @@ func (m pickModel) visibleProfiles() []Profile {
 	}
 	var out []Profile
 	for _, p := range m.profiles {
-		if strings.Contains(strings.ToLower(p.Name), q) {
+		if strings.Contains(strings.ToLower(p.Name), q) || strings.Contains(strings.ToLower(p.Alias), q) {
 			out = append(out, p)
 		}
 	}
@@ -480,6 +482,8 @@ func (m pickModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateWizName(msg)
 	case modeWizFallback:
 		return m.updateWizFallback(msg)
+	case modeAlias:
+		return m.updateAlias(msg)
 	}
 	return m, nil
 }
@@ -541,6 +545,15 @@ func (m pickModel) updateHistory(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		if m.cursor < len(rows) {
 			m.deleteTarget = m.cursor
+		}
+	case "a":
+		if m.cursor < len(rows) {
+			m.aliasTarget = rows[m.cursor].Name
+			m.mode = modeAlias
+			m.notice = ""
+			m.nameInput.Placeholder = "alias (empty clears)"
+			m.nameInput.SetValue(rows[m.cursor].Alias)
+			m.nameInput.Focus()
 		}
 	case "enter":
 		if m.cursor == newSetupIdx || len(rows) == 0 {
@@ -648,6 +661,9 @@ func (m pickModel) openModelPane() (tea.Model, tea.Cmd) {
 	}
 	if m.modelProbedAt == nil {
 		m.modelProbedAt = map[string]time.Time{}
+	}
+	if skipModelProbe(m.cfg, opt.Name) {
+		return m, nil
 	}
 	m.modelProbedAt[opt.Name] = time.Now()
 	return m, probeModelsCmd(m.cfg, opt.Name, opt.ModelIDs)
@@ -912,6 +928,8 @@ func (m pickModel) View() string {
 		b.WriteString(m.viewWizName())
 	case modeWizFallback:
 		b.WriteString(m.viewWizFallback())
+	case modeAlias:
+		b.WriteString(m.viewAlias())
 	}
 
 	fmt.Fprintln(&b, hr(w))
@@ -932,6 +950,8 @@ func (m pickModel) statusBar() string {
 		mode = "create: name and save"
 	case modeWizFallback:
 		mode = "create: confirm free fallback"
+	case modeAlias:
+		mode = "set alias"
 	}
 	model := "-"
 	if m.mode == modeWizModel || m.mode == modeWizSub {
@@ -968,7 +988,11 @@ func (m pickModel) viewHistory() string {
 		fmt.Fprintln(&b, styleDim.Render("no saved setups yet"))
 	}
 	for i, p := range rows {
-		line := fmt.Sprintf("%-24s  %3d use(s)  %s", p.Name, p.Uses, relativeTime(p.LastUsed, m.now))
+		label := p.Name
+		if p.Alias != "" {
+			label = p.Alias + "  (" + p.Name + ")"
+		}
+		line := fmt.Sprintf("%-24s  %3d use(s)  %s", label, p.Uses, relativeTime(p.LastUsed, m.now))
 		if i == m.cursor {
 			fmt.Fprintln(&b, styleSel.Render("> "+line))
 			b.WriteString(m.renderExpandedRow(p))
@@ -986,7 +1010,7 @@ func (m pickModel) viewHistory() string {
 	} else {
 		fmt.Fprintln(&b, "  "+newLine)
 	}
-	fmt.Fprintln(&b, styleDim.Render("↑↓/jk move · enter select · n new · d delete · / filter · q quit"))
+	fmt.Fprintln(&b, styleDim.Render("↑↓/jk move · enter select · n new · a alias · d delete · / filter · q quit"))
 	return b.String()
 }
 
@@ -1249,4 +1273,50 @@ func (m pickModel) modelProbesPending(sub string) bool {
 	_, started := m.modelProbedAt[sub]
 	_, done := m.modelProbes[sub]
 	return started && !done
+}
+
+// updateAlias edits one setup's alias: enter saves (empty clears), esc cancels.
+// An alias must be one word and unique, or `sc <alias>` would be ambiguous.
+func (m pickModel) updateAlias(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeHistory
+		m.nameInput.Blur()
+		return m, nil
+	case "enter":
+		alias := strings.TrimSpace(m.nameInput.Value())
+		if strings.ContainsAny(alias, " \t") {
+			m.notice = "an alias is one word"
+			return m, nil
+		}
+		for _, p := range m.profiles {
+			if alias != "" && p.Name != m.aliasTarget && (strings.EqualFold(p.Alias, alias) || strings.EqualFold(p.Name, alias)) {
+				m.notice = "'" + alias + "' is already used by " + p.Name
+				return m, nil
+			}
+		}
+		for i := range m.profiles {
+			if m.profiles[i].Name == m.aliasTarget {
+				m.profiles[i].Alias = alias
+			}
+		}
+		_ = saveProfiles(m.profilesPath, m.profiles)
+		m.mode = modeHistory
+		m.notice = ""
+		m.nameInput.Blur()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.nameInput, cmd = m.nameInput.Update(msg)
+	return m, cmd
+}
+
+func (m pickModel) viewAlias() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "alias for %s\n\n  %s\n\n", m.aliasTarget, m.nameInput.View())
+	if m.notice != "" {
+		fmt.Fprintln(&b, styleWarn.Render("! "+m.notice))
+	}
+	fmt.Fprintln(&b, styleDim.Render("enter save · empty clears · esc cancel · then run: sc <alias>"))
+	return b.String()
 }

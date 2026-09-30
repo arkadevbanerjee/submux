@@ -215,6 +215,23 @@ if [ -z "${PREFLIGHT_DONE:-}" ] && ! preflight; then
   exit 1
 fi
 
+# --last / --profile launches never pass through the picker, so stamp uses and last_used here
+# (same RFC3339 local-offset format the picker writes) or `sc` would keep relaunching a stale "last".
+bump_profile() {
+  [ -n "$PROFILE" ] && [ -n "${P:-}" ] || return 0
+  pname="$(printf '%s' "$P" | jq -r '.name // empty')"
+  [ -n "$pname" ] || return 0
+  ts="$(date '+%Y-%m-%dT%H:%M:%S%z' | sed 's/\(..\)$/:\1/')"
+  tmp="$(mktemp)"
+  if jq --arg n "$pname" --arg t "$ts" '(.profiles[] | select(.name == $n)) |= (.uses = ((.uses // 0) + 1) | .last_used = $t)' "$PROFILES" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$PROFILES"
+  else
+    rm -f "$tmp"
+  fi
+  return 0
+}
+bump_profile
+
 # Warn (never block) about a cliproxy login that stopped refreshing: its access token expired
 # more than a day ago, so the refresh token is probably dead and that provider will 503 soon.
 warn_stale_logins() {

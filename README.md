@@ -226,7 +226,7 @@ rather than a crash. Run `submux pick --out <file>` directly to inspect the
 `bin/sc` (symlink it onto PATH) is the short front door. Plain `sc` relaunches
 the last setup; `sc -p` opens the picker; `sc sol` launches the saved setup
 whose alias, name or main model matches "sol" (most recently used wins when
-several match); `sc -l` lists setups; `sc --alias NAME ALIAS` names one.
+several match); `sc -l` lists setups; `sc --alias NAME ALIAS` (or `a` in the picker) names one.
 Anything after the word goes to `claude`.
 
 - **No silent fallbacks.** Keep `default_fallback` and per-route `fallback` at

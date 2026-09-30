@@ -396,3 +396,59 @@ func readBody(r *http.Request) string {
 	b, _ := io.ReadAll(r.Body)
 	return string(b)
 }
+
+// `sc --alias` writes the alias with jq; a picker save must not drop it.
+func TestAliasSurvivesSaveAndReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	if err := os.WriteFile(path, []byte(`{"profiles":[{"name":"p1","main":"gpt-6.1-sol","alias":"sol","uses":1}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ps, _ := loadProfiles(path)
+	ps = touchProfile(ps, "p1", time.Now())
+	if err := saveProfiles(path, ps); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := loadProfiles(path)
+	if len(again) != 1 || again[0].Alias != "sol" || again[0].Uses != 2 {
+		t.Fatalf("after touch+save+reload: %+v, want alias sol kept and uses 2", again)
+	}
+}
+
+func TestAliasKeyEditsAndRejectsDuplicates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profiles.json")
+	ps := []Profile{{Name: "one", Main: "a", Uses: 2}, {Name: "two", Main: "b", Alias: "taken", Uses: 1}}
+	m := newPickModel(&config{}, path, "/tmp/x-cache.json", "", ps, "")
+	m = press(m, "a")
+	if m.mode != modeAlias || m.aliasTarget != "one" {
+		t.Fatalf("a: mode=%v target=%q", m.mode, m.aliasTarget)
+	}
+	m = press(m, "taken")
+	m = press(m, "enter")
+	if m.mode != modeAlias || !strings.Contains(m.notice, "already used") {
+		t.Fatalf("duplicate alias accepted: mode=%v notice=%q", m.mode, m.notice)
+	}
+	m.nameInput.SetValue("fast")
+	m = press(m, "enter")
+	if m.mode != modeHistory || m.profiles[0].Alias != "fast" {
+		t.Fatalf("alias not saved: mode=%v profiles=%+v", m.mode, m.profiles)
+	}
+	saved, _ := loadProfiles(path)
+	if saved[0].Alias != "fast" && saved[1].Alias != "fast" {
+		t.Fatalf("alias not on disk: %+v", saved)
+	}
+	if v := m.View(); !strings.Contains(v, "fast  (one)") {
+		t.Fatalf("history row does not show the alias:\n%s", v)
+	}
+}
+
+func TestSkipModelProbeSkipsKiro(t *testing.T) {
+	cfg := &config{SubscriptionProbes: []subscriptionProbe{{Subscription: "Kiro", Model: "k", SkipModelProbe: true}}}
+	m := newPickModel(cfg, "/tmp/x-p.json", "/tmp/x-c.json", "", nil, "")
+	m.mode = modeWizSub
+	m.burnRefreshChecked, m.probesSent = true, true
+	m.catalog = []subscriptionOption{{Name: "Kiro", ModelIDs: []string{"k1", "k2"}}}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || next.(pickModel).mode != modeWizModel {
+		t.Fatalf("Kiro list opened with a probe cmd (cmd=%v) or wrong mode", cmd != nil)
+	}
+}

@@ -20,6 +20,7 @@ import (
 // the zero value a brand new profile starts with.
 type Profile struct {
 	Name     string `json:"name"`
+	Alias    string `json:"alias,omitempty"` // short handle for `sc <alias>`; unique across profiles
 	Main     string `json:"main,omitempty"`
 	Fable    string `json:"fable,omitempty"`
 	Opus     string `json:"opus,omitempty"`
