@@ -245,6 +245,12 @@ fi
 EXTRA=""
 [ -n "$MAIN_ID" ] && EXTRA="$EXTRA --model $MAIN_ID"
 [ -n "$EFFORT" ]  && EXTRA="$EXTRA --effort $EFFORT"
+# Status line that shows the model the relay ACTUALLY used (not the picked name), unless the
+# user already has a statusLine of their own. SUBMUX_NO_STATUSLINE=1 turns it off.
+if [ -z "${SUBMUX_NO_STATUSLINE:-}" ] && command -v submux >/dev/null 2>&1 &&
+  ! jq -e '.statusLine' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
+  set -- --settings '{"statusLine":{"type":"command","command":"submux statusline"}}' "$@"
+fi
 # Unquoted $EXTRA is intentional and safe: values are picked from fixed enum or model id
 # shellcheck disable=SC2086
 exec claude $EXTRA "$@"

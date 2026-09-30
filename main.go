@@ -35,6 +35,8 @@ func main() {
 		cmdStatus(os.Args[2:])
 	case "pick":
 		cmdPick(os.Args[2:])
+	case "statusline":
+		cmdStatusline(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -51,7 +53,8 @@ func usage() {
   submux check <model-id> [--config PATH]
   submux models [--config PATH]
   submux status [--config PATH] [--listen ADDR]
-  submux pick [--config PATH] --out PATH`)
+  submux pick [--config PATH] --out PATH
+  submux statusline            (Claude Code statusLine command; reads its JSON on stdin)`)
 }
 
 func resolveConfigPath(flagVal string) (string, error) {
@@ -84,6 +87,9 @@ func cmdServe(args []string) {
 	}
 
 	srv := newServer(cfg, *debugHeaders)
+	if sp, err := servedPath(); err == nil {
+		srv.served = newServedStore(sp)
+	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

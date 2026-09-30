@@ -48,6 +48,7 @@ type server struct {
 	proxy        *httputil.ReverseProxy
 	cooldowns    *cooldownStore
 	history      *fallbackHistory
+	served       *servedStore // nil in tests; set by cmdServe
 }
 
 func newServer(cfg *config, debugHeaders bool) *server {
@@ -146,6 +147,16 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.retryOrExhaust(ac, rec, r, bm.Model, until, 0, nil, nil, 0)
 	} else {
 		s.proxy.ServeHTTP(rec, r)
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") && !strings.Contains(r.URL.Path, "count_tokens") {
+		s.served.record(r.Header.Get("X-Claude-Code-Session-Id"), bm.Model, servedEntry{
+			Served:    ac.attempted[len(ac.attempted)-1],
+			Status:    rec.status,
+			LatencyMS: time.Since(start).Milliseconds(),
+			At:        time.Now(),
+			Fallback:  len(ac.attempted) > 1,
+		})
 	}
 
 	modelField := fmt.Sprintf("%q", bm.Model)
