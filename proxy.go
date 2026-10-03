@@ -192,6 +192,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tried:          map[string]bool{bm.Model: true},
 		attempted:      []string{bm.Model},
 		isAgent:        r.Header.Get("x-claude-code-agent-id") != "",
+		kiroMode:       kiroMode,
 	}
 	ctx := context.WithValue(r.Context(), routeCtxKey, rt)
 	ctx = context.WithValue(ctx, attemptCtxKey, ac)

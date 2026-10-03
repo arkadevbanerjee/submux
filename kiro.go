@@ -176,6 +176,11 @@ func (s *server) kiroLive() []string {
 			ids = append(ids, m.ID)
 		}
 	}
+	if len(ids) == 0 {
+		// An empty list is a transient upstream blip, not an answer: keep
+		// the stale list and retry on the next request.
+		return s.kiroList.ids
+	}
 	s.kiroList = kiroLiveList{at: time.Now(), ids: ids}
 	return ids
 }
