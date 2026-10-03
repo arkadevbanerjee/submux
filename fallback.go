@@ -47,6 +47,7 @@ type attemptCtx struct {
 	tried          map[string]bool
 	attempted      []string // ids actually dispatched upstream, in order
 	isAgent        bool
+	kiroMode       bool // /kiro request: never dispatch to a passthrough (Anthropic) route
 
 	// populated by modifyResponse when the most recent attempt hit a
 	// fallback_status_codes status; consumed by errorHandlerFallback.
@@ -206,7 +207,7 @@ func (s *server) pickNext(ac *attemptCtx) (string, route, bool) {
 			continue
 		}
 		rt, ok := matchRoute(s.conf().Routes, id)
-		if !ok {
+		if !ok || (ac.kiroMode && rt.authKind == "passthrough") {
 			ac.tried[id] = true
 			continue
 		}
