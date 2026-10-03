@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -50,6 +51,11 @@ type server struct {
 	cooldowns    *cooldownStore
 	history      *fallbackHistory
 	served       *servedStore // nil in tests; set by cmdServe
+
+	kiroMu   sync.Mutex
+	kiroList kiroLiveList
+	// kiroLiveFn overrides the live Kiro id list (tests); nil uses kiroLive.
+	kiroLiveFn func() []string
 }
 
 // conf returns the live config. A hot reload replaces the pointer, never the pointee.
@@ -78,6 +84,19 @@ func newServer(cfg *config, debugHeaders bool) *server {
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
+	// Kiro mode marker: /kiro/v1/messages -> /v1/messages, remembered so the
+	// request can never take the claude-* Anthropic route. Log the raw URI.
+	loggedURI := r.URL.RequestURI()
+	kiroMode := false
+	if r.URL.Path == kiroPathPrefix || strings.HasPrefix(r.URL.Path, kiroPathPrefix+"/") {
+		kiroMode = true
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, kiroPathPrefix)
+		r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, kiroPathPrefix)
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+	}
+
 	if r.Method == http.MethodGet && r.URL.Path == statusPath {
 		s.serveStatus(w, r)
 		return
@@ -100,6 +119,36 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(buf, &bm) // best-effort; leaves bm.Model == "" on any failure
 	noModel := bm.Model == ""
 
+	// Kiro mode: map the requested id onto the live Kiro list and carry on
+	// as if the client had asked for that kiro/* id.
+	requested := bm.Model
+	if kiroMode && !noModel {
+		liveFn := s.kiroLive
+		if s.kiroLiveFn != nil {
+			liveFn = s.kiroLiveFn
+		}
+		live := liveFn()
+		sent, closest, ok := kiroResolve(bm.Model, live)
+		if !ok {
+			msg := fmt.Sprintf("submux kiro mode: no Kiro model matches %q; closest Kiro ids: %s", bm.Model, strings.Join(closest, ", "))
+			if len(live) == 0 {
+				msg = fmt.Sprintf("submux kiro mode: Kiro model list unavailable, cannot map %q", bm.Model)
+			}
+			log.Printf("model=%q kiro-mode no match closest=%v path=%q", bm.Model, closest, loggedURI)
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", msg)
+			return
+		}
+		if sent != bm.Model {
+			rewritten, err := rewriteModelInBody(buf, sent)
+			if err != nil {
+				writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "submux: kiro mode rewrite failed: body is not valid JSON")
+				return
+			}
+			buf = rewritten
+			bm.Model = sent
+		}
+	}
+
 	var rt route
 	var matched bool
 	if noModel && s.conf().NoModelRoute != nil {
@@ -113,6 +162,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !matched {
 		writeAnthropicError(w, http.StatusBadGateway, "invalid_request_error", "submux: no route matched and no \"*\" fallback is configured")
+		return
+	}
+
+	if kiroMode && rt.authKind == "passthrough" {
+		writeAnthropicError(w, http.StatusBadGateway, "invalid_request_error", "submux kiro mode: refusing to route to a passthrough (Anthropic) upstream")
 		return
 	}
 
@@ -155,7 +209,7 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasPrefix(r.URL.Path, "/v1/messages") && !strings.Contains(r.URL.Path, "count_tokens") {
-		s.served.record(r.Header.Get("X-Claude-Code-Session-Id"), bm.Model, servedEntry{
+		s.served.record(r.Header.Get("X-Claude-Code-Session-Id"), requested, servedEntry{
 			Served:    ac.attempted[len(ac.attempted)-1],
 			Status:    rec.status,
 			LatencyMS: time.Since(start).Milliseconds(),
@@ -167,9 +221,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	modelField := fmt.Sprintf("%q", bm.Model)
 	if noModel {
 		modelField = fmt.Sprintf("%q (no-model -> %s)", bm.Model, rt.match)
+	} else if requested != bm.Model {
+		modelField = fmt.Sprintf("%q (kiro-mode -> %q)", requested, bm.Model)
 	}
 	log.Printf("model=%s match=%q upstream=%s auth=%s status=%d bytes=%d duration=%s agent=%v path=%q",
-		modelField, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent, r.URL.RequestURI())
+		modelField, rt.match, rt.upstreamURL.Host, authModeLabel(rt), rec.status, rec.bytes, time.Since(start), ac.isAgent, loggedURI)
 }
 
 // readBodyLimited reads up to limit+1 bytes; if that read produced more
