@@ -11,7 +11,8 @@ model id already present in each request body, and it never substitutes one
 model for another unless you explicitly configure a fallback.
 
 - [Quick start](#quick-start)
-- [Everyday use: `sc`](#everyday-use-sc)
+- [Everyday use: plain `claude` with `/model`](#everyday-use-plain-claude-with-model)
+- [Launcher: `sc`](#launcher-sc)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
 - [Commands](#commands)
@@ -29,24 +30,41 @@ Requires Go 1.27+ and Claude Code. The relay (`serve`, `routes`, `check`,
 go build -o ~/bin/submux .                    # build the relay
 mkdir -p ~/.config/submux
 cp config.example.json ~/.config/submux/config.json   # edit routes and auth
-ln -s "$PWD/bin/submux-claude" ~/bin/submux-claude
-ln -s "$PWD/bin/sc" ~/bin/sc                  # short front door, needs jq
-
 submux check claude-sonnet-5-5                # which route and subscription pays for an id
-sc -p                                         # pick models in the TUI and launch Claude Code
+submux models                                 # every id each upstream serves today
 ```
 
-The launcher starts `submux serve` on the configured port if nothing is
-listening, so you do not run the relay by hand. To run it detached yourself:
+Run the relay detached:
 
 ```sh
 nohup submux serve --listen 127.0.0.1:8787 >> ~/.local/state/submux/submux.log 2>&1 &
 ```
 
-## Everyday use: `sc`
+## Everyday use: plain `claude` with `/model`
 
-`bin/sc` is the short front door to `submux-claude`. Plain `claude` is never
-touched, so keep using it for normal sessions.
+Point Claude Code at the relay and load the
+[model-router plugin](claude-plugin/model-router/README.md) in
+`~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/submux/claude-plugin/model-router"
+  }
+}
+```
+
+Then start `claude` as usual. The native `/model` picker lists every id
+`submux models` serves, and `/model` subcommands set the model, effort and
+fallback per tier or subagent type. Keep `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` unset so `claude-*` requests pass your own login through.
+
+## Launcher: `sc`
+
+The older path. `bin/sc` is the short front door to `submux-claude`, which
+starts `submux serve` if nothing is listening and launches `claude` with the
+picked models (`ln -s "$PWD/bin/sc" ~/bin/sc`, needs jq).
 
 | Command | Does |
 |---|---|
