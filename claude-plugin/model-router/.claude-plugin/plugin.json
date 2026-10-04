@@ -1,0 +1,1 @@
+{ "name": "model-router", "version": "0.1.0", "description": "/model subcommands: switch model, provider (via submux) and effort live for each tier and each subagent type; bare /model stays the built-in picker", "types": "./types/index.d.ts" }
