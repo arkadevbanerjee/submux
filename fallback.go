@@ -56,6 +56,7 @@ type attemptCtx struct {
 	lastTriggerBody    []byte
 	lastRetryAfterSecs int
 	lastCooldownUntil  time.Time
+	disabledTrigger    bool // the last attempt said its subscription is switched off
 }
 
 // cooldownStore tracks model ids that recently triggered a fallback status,
@@ -253,6 +254,24 @@ func (s *server) modifyResponse(resp *http.Response) error {
 	}
 	currentModel := ac.attempted[len(ac.attempted)-1]
 
+	// Checked before the empty-chain return below: a switched-off
+	// subscription fails over to the same model elsewhere even when the
+	// route has no fallback chain (disabled.go).
+	if rt, ok := resp.Request.Context().Value(routeCtxKey).(route); ok && isDisabledResponse(resp, rt) {
+		until := time.Now().Add(disabledFor)
+		s.disabled.markCooling(subKey(rt), until)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		ac.disabledTrigger = true
+		ac.lastTriggerStatus = resp.StatusCode
+		ac.lastTriggerHeader = resp.Header.Clone()
+		ac.lastTriggerBody = bodyBytes
+		ac.lastRetryAfterSecs = 0
+		ac.lastCooldownUntil = until
+		log.Printf("✗ SUBSCRIPTION OFF %q (%d) until %s", subKey(rt), resp.StatusCode, until.Format("15:04"))
+		return errFallbackTrigger
+	}
+
 	// A route with no fallback candidates has nowhere to go, so cooling its
 	// only model would just turn one transient upstream error into
 	// cooldown_default of instant local 503s for every client retry. Pass
@@ -308,6 +327,12 @@ func (s *server) errorHandlerFallback(w http.ResponseWriter, r *http.Request, er
 		return
 	}
 	failedModel := ac.attempted[len(ac.attempted)-1]
+	if ac.disabledTrigger {
+		ac.disabledTrigger = false
+		if s.failOverDisabled(ac, w, r, failedModel) {
+			return
+		}
+	}
 	s.retryOrExhaust(ac, w, r, failedModel, ac.lastCooldownUntil, ac.lastRetryAfterSecs,
 		ac.lastTriggerHeader, ac.lastTriggerBody, ac.lastTriggerStatus)
 }
