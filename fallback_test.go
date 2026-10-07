@@ -323,6 +323,13 @@ func TestStreamingFallbackModelRewrite(t *testing.T) {
 func TestEmptyFallbackNeverCools(t *testing.T) {
 	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only completions count: a kiro/* request may first fetch the live
+		// /v1/models list to map an unlisted spelling (disabled.go).
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"kiro/claude-opus-5.5"}]}`))
+			return
+		}
 		if atomic.AddInt32(&calls, 1) == 1 {
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"type":"error"}`))

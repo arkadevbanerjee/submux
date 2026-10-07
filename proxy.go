@@ -49,6 +49,7 @@ type server struct {
 	debugHeaders bool
 	proxy        *httputil.ReverseProxy
 	cooldowns    *cooldownStore
+	disabled     *cooldownStore // subscription key -> re-enable time (disabled.go)
 	history      *fallbackHistory
 	served       *servedStore // nil in tests; set by cmdServe
 
@@ -62,7 +63,7 @@ type server struct {
 func (s *server) conf() *config { return s.cfgp.Load() }
 
 func newServer(cfg *config, debugHeaders bool) *server {
-	s := &server{debugHeaders: debugHeaders, cooldowns: newCooldownStore(), history: newFallbackHistory()}
+	s := &server{debugHeaders: debugHeaders, cooldowns: newCooldownStore(), disabled: newCooldownStore(), history: newFallbackHistory()}
 	s.cfgp.Store(cfg)
 	s.proxy = &httputil.ReverseProxy{
 		FlushInterval: -1, // flush on every write; anything else buffers SSE and the CLI appears to hang.
@@ -149,6 +150,24 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// A kiro/* id the upstream does not list in this spelling
+	// ("kiro/claude-sonnet-5-5" when Kiro lists claude-sonnet-5.5) maps onto
+	// the live list instead of failing with "unknown provider".
+	if !kiroMode && strings.HasPrefix(bm.Model, kiroIDPrefix) {
+		liveFn := s.kiroLive
+		if s.kiroLiveFn != nil {
+			liveFn = s.kiroLiveFn
+		}
+		if live := liveFn(); unknownKiroID(bm.Model, live) {
+			if sent, _, ok := kiroResolve(bm.Model, live); ok {
+				if rewritten, err := rewriteModelInBody(buf, sent); err == nil {
+					buf = rewritten
+					bm.Model = sent
+				}
+			}
+		}
+	}
+
 	var rt route
 	var matched bool
 	if noModel && s.conf().NoModelRoute != nil {
@@ -203,8 +222,11 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// §9.1: while the originally requested id is cooling, skip its upstream
 	// entirely and go straight down the fallback chain, without ever
 	// dispatching a real request to it.
+	_, subOff := s.disabled.isCooling(subKey(rt), time.Now())
 	if until, cooling := s.cooldowns.isCooling(bm.Model, time.Now()); cooling {
 		s.retryOrExhaust(ac, rec, r, bm.Model, until, 0, nil, nil, 0)
+	} else if subOff && !noModel && s.failOverDisabled(ac, rec, r, bm.Model) {
+		// The subscription is switched off: the same model went to another one.
 	} else {
 		s.proxy.ServeHTTP(rec, r)
 	}
