@@ -255,6 +255,13 @@ func parseAuth(auth string) (kind, source string, err error) {
 			return "", "", fmt.Errorf("auth %q: missing env var name", auth)
 		}
 		return "x-api-key", "env:" + v, nil
+	case strings.HasPrefix(auth, "x-api-key:keychain:"):
+		v := strings.TrimPrefix(auth, "x-api-key:keychain:")
+		service, account, ok := strings.Cut(v, "/")
+		if !ok || service == "" || account == "" {
+			return "", "", fmt.Errorf("auth %q: expected x-api-key:keychain:<service>/<account>", auth)
+		}
+		return "x-api-key", "keychain:" + service + "/" + account, nil
 	default:
 		return "", "", fmt.Errorf("unrecognized auth mode %q", auth)
 	}

@@ -214,10 +214,11 @@ func cmdModels(args []string) {
 	// cliproxy); list each upstream's catalogue once, not once per route.
 	seenUpstream := map[string]bool{}
 	for _, rt := range cfg.Routes {
-		if seenUpstream[rt.upstream] {
+		ckey := rt.routeCacheKey()
+		if seenUpstream[ckey] {
 			continue
 		}
-		seenUpstream[rt.upstream] = true
+		seenUpstream[ckey] = true
 		if err := resolveRouteCredential(&rt); err != nil {
 			fmt.Fprintf(os.Stderr, "submux models: route match=%q: %v\n", rt.match, err)
 			continue
@@ -231,7 +232,7 @@ func cmdModels(args []string) {
 			if !isPickableModelID(m.ID) {
 				continue
 			}
-			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.upstream != rt.upstream {
+			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.routeCacheKey() != ckey {
 				continue
 			}
 			name := rt.subscription

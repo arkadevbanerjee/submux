@@ -148,9 +148,10 @@ func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 
 	var out []upstreamModel
 	afterID := ""
+	pfx := rt.routePrefix()
 	for page := 0; page < 20; page++ {
 		url := base
-		if rt.authKind == "passthrough" {
+		if rt.authKind == "passthrough" || rt.authKind == "x-api-key" {
 			url += "?limit=1000"
 			if afterID != "" {
 				url += "&after_id=" + afterID
@@ -165,6 +166,7 @@ func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 			req.Header.Set("Authorization", "Bearer "+rt.authValue)
 		case "x-api-key":
 			req.Header.Set("x-api-key", rt.authValue)
+			req.Header.Set("anthropic-version", "2023-06-01")
 		case "passthrough":
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Set("anthropic-version", "2023-06-01")
@@ -185,7 +187,12 @@ func fetchUpstreamModels(rt route) ([]upstreamModel, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode %s response: %w", base, err)
 		}
-		out = append(out, parsed.Data...)
+		for _, m := range parsed.Data {
+			if pfx != "" && !strings.HasPrefix(m.ID, pfx) {
+				m.ID = pfx + m.ID
+			}
+			out = append(out, m)
+		}
 		if !parsed.HasMore || parsed.LastID == "" {
 			return out, nil
 		}

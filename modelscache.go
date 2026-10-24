@@ -121,9 +121,10 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 	}
 
 	for _, rt := range cfg.Routes {
+		ckey := rt.routeCacheKey()
 		models, cacheAge, err := modelsForRoute(cfg, rt, entries, now)
 		if err != nil {
-			add(subscriptionOption{Name: routeUnavailableName(rt), Unavailable: err.Error(), Upstreams: []string{rt.upstream}})
+			add(subscriptionOption{Name: routeUnavailableName(rt), Unavailable: err.Error(), Upstreams: []string{ckey}})
 			continue
 		}
 		byGroup := map[string][]string{}
@@ -134,7 +135,7 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 			// The relay routes by id: an id another route claims (Antigravity's
 			// "claude-sonnet-4-6" is served by the claude-* route, i.e. Claude
 			// Max) can never reach this upstream under that id.
-			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.upstream != rt.upstream {
+			if owner, ok := matchRoute(cfg.Routes, m.ID); ok && owner.routeCacheKey() != ckey {
 				continue
 			}
 			// A fixed-label route (claude-*) names its payer outright; only
@@ -156,7 +157,7 @@ func buildSubscriptionCatalog(cfg *config, entries map[string]cacheEntry, now ti
 		for _, n := range names {
 			ids := byGroup[n]
 			sort.Strings(ids)
-			add(subscriptionOption{Name: n, ModelIDs: ids, CacheAge: cacheAge, Upstreams: []string{rt.upstream}})
+			add(subscriptionOption{Name: n, ModelIDs: ids, CacheAge: cacheAge, Upstreams: []string{ckey}})
 		}
 	}
 
@@ -211,7 +212,8 @@ func routeUnavailableName(rt route) string {
 // its age), and only hitting the network when there is no usable cache at
 // all. entries is updated in place on a successful fetch.
 func modelsForRoute(cfg *config, rt route, entries map[string]cacheEntry, now time.Time) ([]cachedModel, string, error) {
-	stale, haveStale := entries[rt.upstream]
+	ckey := rt.routeCacheKey()
+	stale, haveStale := entries[ckey]
 	if haveStale {
 		if now.Sub(stale.FetchedAt) < modelsCacheFreshFor {
 			return stale.Models, "", nil
@@ -223,7 +225,7 @@ func modelsForRoute(cfg *config, rt route, entries map[string]cacheEntry, now ti
 		if err != nil {
 			return stale.Models, relativeTime(stale.FetchedAt.Format(time.RFC3339), now), nil
 		}
-		entries[rt.upstream] = cacheEntry{FetchedAt: now, Models: fresh}
+		entries[ckey] = cacheEntry{FetchedAt: now, Models: fresh}
 		return fresh, "", nil
 	}
 
@@ -231,7 +233,7 @@ func modelsForRoute(cfg *config, rt route, entries map[string]cacheEntry, now ti
 	if err != nil {
 		return nil, "", err
 	}
-	entries[rt.upstream] = cacheEntry{FetchedAt: now, Models: fresh}
+	entries[ckey] = cacheEntry{FetchedAt: now, Models: fresh}
 	return fresh, "", nil
 }
 
@@ -293,11 +295,11 @@ func refreshSubscriptionCmd(cfg *config, subName string, upstreams []string) tea
 	}
 }
 
-// findRouteByUpstream locates the (non-fixed-label) route serving upstream,
+// findRouteByUpstream locates the route serving upstream (or routeCacheKey),
 // so refreshSubscriptionCmd can resolve its credential.
 func findRouteByUpstream(cfg *config, upstream string) (route, bool) {
 	for _, rt := range cfg.Routes {
-		if rt.upstream == upstream {
+		if rt.routeCacheKey() == upstream || rt.upstream == upstream {
 			return rt, true
 		}
 	}
@@ -319,7 +321,7 @@ func payerForModelID(cfg *config, entries map[string]cacheEntry, id string) stri
 		if rt.subscription == "" {
 			continue
 		}
-		for _, m := range entries[rt.upstream].Models {
+		for _, m := range entries[rt.routeCacheKey()].Models {
 			if m.ID == id {
 				return rt.subscription
 			}

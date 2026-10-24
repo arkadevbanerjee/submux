@@ -190,7 +190,14 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	outBody := buf
-	if rt.modelRewrite != nil {
+	if rt.routePrefix() != "" && !noModel {
+		rewritten, err := rewriteAPIKeyBody(buf, bm.Model, rt)
+		if err != nil {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "submux: api route rewrite failed: body is not valid JSON")
+			return
+		}
+		outBody = rewritten
+	} else if rt.modelRewrite != nil {
 		if newModel, ok := rt.modelRewrite[bm.Model]; ok {
 			rewritten, err := rewriteModelInBody(buf, newModel)
 			if err != nil {
@@ -281,16 +288,93 @@ func rewriteModelInBody(body []byte, newModel string) ([]byte, error) {
 	return json.Marshal(generic)
 }
 
+// rewriteAPIKeyBody prepares a request body for a prefixed x-api-key route
+// (such as "api/*" -> https://api.anthropic.com): strips the route prefix and
+// "[1m]" suffix from model, drops the Claude Code x-anthropic-billing-header
+// block from system, and replaces the CLI identity line with the Agent SDK
+// identity line that subscriber promotional API credits cover.
+func rewriteAPIKeyBody(body []byte, modelID string, rt route) ([]byte, error) {
+	var generic map[string]json.RawMessage
+	if err := json.Unmarshal(body, &generic); err != nil {
+		return nil, err
+	}
+	bare := strings.TrimSuffix(strings.TrimPrefix(modelID, rt.routePrefix()), "[1m]")
+	if rt.modelRewrite != nil {
+		if mapped, ok := rt.modelRewrite[bare]; ok {
+			bare = mapped
+		} else if mapped, ok := rt.modelRewrite[modelID]; ok {
+			bare = mapped
+		}
+	}
+	encoded, err := json.Marshal(bare)
+	if err != nil {
+		return nil, err
+	}
+	generic["model"] = encoded
+
+	if sysRaw, ok := generic["system"]; ok {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(sysRaw, &blocks) == nil {
+			kept := blocks[:0]
+			for _, b := range blocks {
+				var txt string
+				if tRaw, hasText := b["text"]; hasText && json.Unmarshal(tRaw, &txt) == nil {
+					if strings.HasPrefix(txt, "x-anthropic-billing-header:") {
+						continue
+					}
+					replaced := replaceClaudeCodeIdentity(txt)
+					if replaced != txt {
+						if encTxt, err := json.Marshal(replaced); err == nil {
+							b["text"] = encTxt
+						}
+					}
+				}
+				kept = append(kept, b)
+			}
+			if encSys, err := json.Marshal(kept); err == nil {
+				generic["system"] = encSys
+			}
+		} else {
+			var sysStr string
+			if json.Unmarshal(sysRaw, &sysStr) == nil {
+				if replaced := replaceClaudeCodeIdentity(sysStr); replaced != sysStr {
+					if encSys, err := json.Marshal(replaced); err == nil {
+						generic["system"] = encSys
+					}
+				}
+			}
+		}
+	}
+	return json.Marshal(generic)
+}
+
+var claudeCodeIdentities = []string{
+	"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+	"You are Claude Code, Anthropic's official CLI for Claude.",
+	"You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+	"You are Claude Code,",
+}
+
+func replaceClaudeCodeIdentity(s string) string {
+	for _, id := range claudeCodeIdentities {
+		if strings.Contains(s, id) {
+			s = strings.ReplaceAll(s, id, "You are Claude, an interactive CLI assistant for software engineering.")
+		}
+	}
+	return s
+}
+
 // applyHeaderPolicy is the security core of this tool (§3). It mutates hdr
 // in place, in the following order:
 //  1. passthrough: leave Authorization/x-api-key/anthropic-*/user-agent/
 //     x-app exactly as received.
 //     non-passthrough: DELETE the inbound Authorization and x-api-key,
-//     then set the configured credential. A subscription bearer must never
-//     reach a third-party upstream.
-//  2. non-passthrough only: strip oauth-* entries from anthropic-beta.
-//  3. non-passthrough only: the defensive sk-ant- guard, independent of (1).
-//  4. both: strip hop-by-hop headers.
+//     run the defensive sk-ant- guard on inbound headers, then set the
+//     configured credential. A subscription bearer must never reach a
+//     third-party upstream.
+//  2. non-passthrough only: strip oauth-* entries (and claude-code-* on
+//     x-api-key routes) from anthropic-beta.
+//  3. both: strip hop-by-hop headers.
 func applyHeaderPolicy(hdr http.Header, rt route, debugHeaders bool) {
 	if rt.authKind == "passthrough" {
 		stripHopByHop(hdr)
@@ -302,24 +386,33 @@ func applyHeaderPolicy(hdr http.Header, rt route, debugHeaders bool) {
 
 	hdr.Del("Authorization")
 	hdr.Del("X-Api-Key")
+	dropHeadersContaining(hdr, tokenLeakMarker)
 
 	switch rt.authKind {
 	case "bearer":
 		hdr.Set("Authorization", "Bearer "+rt.authValue)
 	case "x-api-key":
 		hdr.Set("x-api-key", rt.authValue)
+		hdr.Del("X-App")
+		for k := range hdr {
+			if strings.HasPrefix(strings.ToLower(k), "x-claude-code-") {
+				hdr.Del(k)
+			}
+		}
+		if strings.HasPrefix(hdr.Get("User-Agent"), "claude-cli/") {
+			hdr.Set("User-Agent", "claude-agent-sdk/0.1.0")
+		}
 	case "none":
 		// send no credential
 	}
 
 	if beta := hdr.Get("anthropic-beta"); beta != "" {
-		hdr.Set("anthropic-beta", stripOAuthBetaEntries(beta))
+		hdr.Set("anthropic-beta", stripOAuthBetaEntries(beta, rt.authKind == "x-api-key"))
 		if hdr.Get("anthropic-beta") == "" {
 			hdr.Del("anthropic-beta")
 		}
 	}
 
-	dropHeadersContaining(hdr, tokenLeakMarker)
 	stripHopByHop(hdr)
 
 	if debugHeaders {
@@ -328,13 +421,18 @@ func applyHeaderPolicy(hdr http.Header, rt route, debugHeaders bool) {
 }
 
 // stripOAuthBetaEntries removes any comma-separated entry that starts with
-// "oauth-" from an anthropic-beta header value; a non-Anthropic upstream
-// has no use for it and some upstreams 400 on it.
-func stripOAuthBetaEntries(beta string) string {
+// "oauth-" (and "claude-code-" when stripClaudeCode is true) from an
+// anthropic-beta header value.
+func stripOAuthBetaEntries(beta string, stripClaudeCode ...bool) string {
+	dropCC := len(stripClaudeCode) > 0 && stripClaudeCode[0]
 	parts := strings.Split(beta, ",")
 	kept := parts[:0]
 	for _, p := range parts {
-		if strings.HasPrefix(strings.TrimSpace(p), "oauth-") {
+		trimmed := strings.TrimSpace(p)
+		if strings.HasPrefix(trimmed, "oauth-") {
+			continue
+		}
+		if dropCC && strings.HasPrefix(trimmed, "claude-code-") {
 			continue
 		}
 		kept = append(kept, p)

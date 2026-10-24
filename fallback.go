@@ -175,6 +175,9 @@ func parseRetryAfterOrDefault(v string, def time.Duration) time.Duration {
 // (§9.2.5, §3): the caller is responsible for using the original bytes
 // untouched on the first attempt.
 func composeFallbackBody(original []byte, modelID string, rt route) ([]byte, error) {
+	if rt.routePrefix() != "" {
+		return rewriteAPIKeyBody(original, modelID, rt)
+	}
 	body, err := rewriteModelInBody(original, modelID)
 	if err != nil {
 		return nil, err

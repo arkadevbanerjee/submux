@@ -55,7 +55,7 @@ func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 		res.Detail = err.Error()
 		return res
 	}
-	model := strings.TrimSuffix(p.Model, "[1m]")
+	model := strings.TrimSuffix(strings.TrimPrefix(p.Model, rt.routePrefix()), "[1m]")
 	if rewritten, ok := rt.modelRewrite[model]; ok {
 		model = rewritten
 	}
@@ -67,7 +67,9 @@ func probeSubscription(cfg *config, p subscriptionProbe) probeResult {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("X-Claude-Code-Session-Id", "submux-probe") // kirocc rejects a request without one
+	if rt.authKind != "x-api-key" {
+		req.Header.Set("X-Claude-Code-Session-Id", "submux-probe") // kirocc rejects a request without one
+	}
 	switch rt.authKind {
 	case "bearer":
 		req.Header.Set("Authorization", "Bearer "+rt.authValue)

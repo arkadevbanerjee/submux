@@ -239,3 +239,40 @@ func TestCatalogDeadUpstreamDegradesOnlyThatSubscription(t *testing.T) {
 		t.Fatalf("dead upstream's subscription should show as unavailable: %+v", cat)
 	}
 }
+
+// TestCatalogPrefixedXAPIKeyCoexistsWithPassthrough verifies that a passthrough
+// route ("claude-*") and a prefixed x-api-key route ("api/*") pointing at the
+// same Anthropic upstream both list their models in buildSubscriptionCatalog
+// without colliding in the cache or skipping the second route.
+func TestCatalogPrefixedXAPIKeyCoexistsWithPassthrough(t *testing.T) {
+	old := claudeLoginToken
+	claudeLoginToken = func() (string, error) { return "tok-123", nil }
+	t.Cleanup(func() { claudeLoginToken = old })
+
+	url, _ := modelsServer(t, []upstreamModel{
+		{ID: "claude-sonnet-5-5", OwnedBy: "anthropic", MaxInputTokens: 1_000_000},
+		{ID: "claude-haiku-5-5", OwnedBy: "anthropic", MaxInputTokens: 200_000},
+	})
+	t.Setenv("SUBMUX_TEST_PROMO_KEY", "sk-ant-api03-test")
+	cfg := &config{
+		Routes: []route{
+			{match: "claude-*", upstream: url, authKind: "passthrough", subscription: "Claude Max"},
+			{match: "api/*", upstream: url, auth: "x-api-key:env:SUBMUX_TEST_PROMO_KEY", authKind: "x-api-key", authSource: "env:SUBMUX_TEST_PROMO_KEY", subscription: "Anthropic API ($100 promo)"},
+		},
+	}
+	cat := buildSubscriptionCatalog(cfg, map[string]cacheEntry{}, time.Now())
+	if len(cat) != 2 {
+		t.Fatalf("catalog = %+v, want 2 rows (Anthropic API and Claude Max)", cat)
+	}
+	bySub := map[string][]string{}
+	for _, opt := range cat {
+		bySub[opt.Name] = opt.ModelIDs
+	}
+	if got := strings.Join(bySub["Claude Max"], ","); got != "claude-haiku-5-5,claude-sonnet-5-5,claude-sonnet-5-5[1m]" {
+		t.Errorf("Claude Max ids = %s, want unprefixed ids", got)
+	}
+	if got := strings.Join(bySub["Anthropic API ($100 promo)"], ","); got != "api/claude-haiku-5-5,api/claude-sonnet-5-5,api/claude-sonnet-5-5[1m]" {
+		t.Errorf("Anthropic API ids = %s, want api/-prefixed ids", got)
+	}
+}
+

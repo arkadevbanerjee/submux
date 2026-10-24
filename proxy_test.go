@@ -441,3 +441,64 @@ func TestLogLinePathPresent(t *testing.T) {
 		t.Errorf("log line = %q, want it to contain path=\"/v1/messages?beta=true\"", line)
 	}
 }
+
+// TestPrefixedXAPIKeyRoute verifies that an x-api-key:keychain route with a
+// prefix match ("api/*") parses in loadConfig, preserves its own sk-ant-api03-
+// x-api-key while stripping inbound Claude Code OAuth/app markers, strips the
+// route prefix ("api/") from the outbound model field, and strips the
+// x-anthropic-billing-header block from system so subscriber API credits can pay.
+func TestPrefixedXAPIKeyRoute(t *testing.T) {
+	const promoKey = "sk-ant-api03-PROMO-KEY-123"
+	const oauthBearer = "Bearer sk-ant-oat01-SUBSCRIPTION-TOKEN"
+
+	if _, _, err := parseAuth("x-api-key:keychain:anthropic/PROMO_API_KEY"); err != nil {
+		t.Fatalf("parseAuth(x-api-key:keychain:...) failed: %v", err)
+	}
+
+	apiCapture, apiSrv := newCaptureServer(t)
+	routes := []route{
+		{
+			match:        "api/*",
+			upstream:     apiSrv.URL,
+			upstreamURL:  mustParseURL(t, apiSrv.URL),
+			auth:         "x-api-key:keychain:anthropic/PROMO_API_KEY",
+			authKind:     "x-api-key",
+			authSource:   "keychain:anthropic/PROMO_API_KEY",
+			authValue:    promoKey,
+			subscription: "Anthropic API ($100 promo)",
+		},
+	}
+	cfg := &config{Listen: "127.0.0.1:0", MaxBodyBytes: defaultMaxBodyBytes, Routes: routes}
+	s := newServer(cfg, false)
+
+	body := []byte(`{"model":"api/claude-sonnet-5-5","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.301; cc_entrypoint=cli;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=true", bytes.NewReader(body))
+	req.Header.Set("Authorization", oauthBearer)
+	req.Header.Set("anthropic-beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+	req.Header.Set("x-app", "cli")
+	req.Header.Set("User-Agent", "claude-cli/2.1.301 (external, cli)")
+	req.Header.Set("x-claude-code-session-id", "sess-1")
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	gotHeader, gotBody := apiCapture.snapshot(t)
+	if got := gotHeader.Get("x-api-key"); got != promoKey {
+		t.Errorf("x-api-key = %q, want %q (must not be stripped by tokenLeakMarker)", got, promoKey)
+	}
+	if got := gotHeader.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want empty", got)
+	}
+	if got := gotHeader.Get("anthropic-beta"); got != "interleaved-thinking-2025-05-14" {
+		t.Errorf("anthropic-beta = %q, want claude-code-* and oauth-* stripped", got)
+	}
+	if got := gotHeader.Get("x-app"); got != "" {
+		t.Errorf("x-app = %q, want stripped", got)
+	}
+	if strings.Contains(string(gotBody), `"api/claude-sonnet-5-5"`) || !strings.Contains(string(gotBody), `"model":"claude-sonnet-5-5"`) {
+		t.Errorf("outbound body = %s, want model rewritten to claude-sonnet-5-5", gotBody)
+	}
+	if strings.Contains(string(gotBody), "x-anthropic-billing-header:") || strings.Contains(string(gotBody), "You are Claude Code") {
+		t.Errorf("outbound body still contains Claude Code billing/identity marker: %s", gotBody)
+	}
+}
+

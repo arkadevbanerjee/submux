@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // globMatch matches s against pattern, treating pattern as an opaque glob
@@ -97,10 +98,6 @@ func matchRoute(routes []route, modelID string) (route, bool) {
 	return route{}, false
 }
 
-// describeRoute renders a one-line human summary, used by `submux routes`
-// and `submux check`. Never includes the resolved credential value. A route
-// with a fixed subscription label (§2.6) appends subscription="<name>"; this
-// stays an OFFLINE string format, no network call.
 func describeRoute(r route) string {
 	s := fmt.Sprintf("match=%q upstream=%s auth=%s", r.match, r.upstream, r.auth)
 	if r.subscription != "" {
@@ -108,3 +105,28 @@ func describeRoute(r route) string {
 	}
 	return s
 }
+
+// routePrefix returns the "<prefix>/" of a prefixed x-api-key route (for
+// example "api/" when match="api/*" and authKind="x-api-key"), or "" when
+// model ids are used as-is.
+func (r route) routePrefix() string {
+	if r.authKind != "x-api-key" || !strings.HasSuffix(r.match, "/*") {
+		return ""
+	}
+	pfx := strings.TrimSuffix(r.match, "*")
+	if strings.ContainsAny(pfx, "*?") {
+		return ""
+	}
+	return pfx
+}
+
+// routeCacheKey distinguishes a prefixed x-api-key route ("api/*") from a
+// passthrough route ("claude-*") sharing the same upstream URL, while keeping
+// shared aggregator routes ("kiro/*" and "*") under a single upstream key.
+func (r route) routeCacheKey() string {
+	if r.routePrefix() != "" {
+		return r.upstream + "#" + r.match
+	}
+	return r.upstream
+}
+
