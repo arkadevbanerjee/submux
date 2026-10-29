@@ -21,7 +21,7 @@ def main():
         print('submux-claude: slimming requires mitmdump and lsof', file=sys.stderr)
         return 1
 
-    root = Path(os.environ.get('SLIM_SUBMUX_STATE_ROOT', Path.home() / '.local/state/slim-tools/submux'))
+    root = Path.home() / '.local/state/slim-tools/submux'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     state = Path(tempfile.mkdtemp(prefix='sc-', dir=root))
     env = dict(os.environ, SLIM_STATE=str(state), SLIM_TOOLS='1')

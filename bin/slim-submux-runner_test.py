@@ -85,7 +85,7 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('Before your first Artifact call', Handler.body['tools'][0]['description'])
             state = Path(result.stdout.strip())
-            self.assertEqual(state.parent, root)
+            self.assertEqual(state.parent, root / '.local/state/slim-tools/submux')
             self.assertIn('FULL MANUAL', (state / 'Artifact.md').read_text())
 
 
