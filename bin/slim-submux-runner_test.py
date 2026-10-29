@@ -28,11 +28,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class RunnerTest(unittest.TestCase):
+    def home_env(self, home):
+        agents = home / '.agents'
+        agents.mkdir()
+        (agents / 'slim-tools').symlink_to(Path.home() / '.agents/slim-tools')
+        return dict(os.environ, HOME=str(home), SLIM_SUBMUX_STATE_ROOT=str(home / 'unexpected'))
+
     def test_term_stops_proxy_and_child(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / 'wait.py'
             fake.write_text('import os, time\nprint(os.getpid(), os.environ["ANTHROPIC_BASE_URL"], flush=True)\ntime.sleep(30)\n')
-            env = dict(os.environ, SLIM_SUBMUX_STATE_ROOT=d)
+            env = self.home_env(Path(d))
             runner = subprocess.Popen([sys.executable, str(HERE / 'slim-submux-runner.py'), '9', sys.executable, str(fake)],
                                       env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             proxy_pid = child_pid = None
@@ -69,7 +75,7 @@ class RunnerTest(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                env = dict(os.environ, SLIM_SUBMUX_STATE_ROOT=d)
+                env = self.home_env(root)
                 result = subprocess.run([sys.executable, str(HERE / 'slim-submux-runner.py'), str(server.server_port), sys.executable, str(fake)],
                                         env=env, capture_output=True, text=True, timeout=25)
             finally:
