@@ -296,6 +296,14 @@ if [ -z "${SUBMUX_NO_STATUSLINE:-}" ] && command -v submux >/dev/null 2>&1 &&
   ! jq -e '.statusLine' "$HOME/.claude/settings.json" >/dev/null 2>&1; then
   set -- --settings '{"statusLine":{"type":"command","command":"submux statusline"}}' "$@"
 fi
+# When slim-tools is installed, use its existing rewrites and manual guard on
+# the local relay too. Each session gets its own proxy and manual state.
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+SLIM_RUNNER="$SCRIPT_DIR/slim-submux-runner.py"
+if [ -f "$SLIM_RUNNER" ] && [ -f "$HOME/.agents/slim-tools/slim_tools.py" ] && command -v python3 >/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  exec python3 "$SLIM_RUNNER" "$PORT" claude $EXTRA "$@"
+fi
 # Unquoted $EXTRA is intentional and safe: values are picked from fixed enum or model id
 # shellcheck disable=SC2086
 exec claude $EXTRA "$@"
