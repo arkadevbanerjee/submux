@@ -6,6 +6,9 @@
 #   sc sol [claude args]   launch the saved profile that matches "sol"
 #   sc -l                  list saved profiles (alias, main model, effort, uses)
 #   sc --alias NAME ALIAS  give a profile a short alias (NAME may be any sc match)
+#   sc sol --resume [id]   resume a session through that profile (model of choice)
+#   sc --resume [id]       resume through the last profile, not a bare claude login
+#   sc -c, sc --continue   continue through the last profile
 #
 # A word matches a profile by exact alias, exact name, then a case-insensitive
 # substring of alias, name or main model id. Several matches: the most recently
@@ -35,7 +38,8 @@ resolve() {
 case "${1:-}" in
   "") exec "$LAUNCH" --last ;;
   -p | --pick | pick) shift; exec "$LAUNCH" -- "$@" ;;
-  -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) awk 'NR==1 {next} /^set -eu$/ {exit} /^#/ {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+  --resume|-r|--continue|-c) exec "$LAUNCH" --last -- "$@" ;;
   -l | --list)
     need_profiles
     jq -r '.profiles | sort_by(.last_used) | reverse[] | [(.alias // "-"), .main, .effort, "\(.uses)x", .name] | @tsv' "$PROFILES" |
