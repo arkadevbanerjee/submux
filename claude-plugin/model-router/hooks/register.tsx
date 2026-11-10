@@ -4,7 +4,7 @@ import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'c
 import type { Effort, Provider, Routes, Rule, Seen, Slot, Spawn } from '../types'
 import {
   EFFORTS, EMPTY, SLOTS, contextWarning, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
-  modelArgs, parseShort, parseTag, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
+  modelArgs, parseShort, parseTag, pickRow, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
 } from './route'
 
 const routes = atom({ plugin: 'model-router', key: 'routes' } as const, EMPTY)
@@ -14,14 +14,18 @@ const profiles = atom({ plugin: 'model-router', key: 'profiles' } as const, {} a
 const spawns = atom({ plugin: 'model-router', key: 'spawns' } as const, {} as Record<string, Spawn>)
 const seen = atom({ plugin: 'model-router', key: 'seen' } as const, {} as Record<string, Seen>)
 
-const GUIDE = '.config/submux/routing-guide.md'
+/** The harness-neutral role table every harness reads first; the old Claude-only guide is the fallback. */
+const GUIDES = ['.agents/routing.md', '.config/submux/routing-guide.md']
 
 async function guideText($: EngineInterface): Promise<string> {
-  try {
-    return await $.fs.read(`${(await $.env.get('HOME')) ?? ''}/${GUIDE}`)
-  } catch {
-    return ''
+  const home = (await $.env.get('HOME')) ?? ''
+  for (const g of GUIDES) {
+    try {
+      const t = await $.fs.read(`${home}/${g}`)
+      if (t.trim()) return t
+    } catch {}
   }
+  return ''
 }
 
 /** Routes frozen at spawn but not yet tied to an agentId (the first step can come first). */
@@ -73,17 +77,19 @@ async function bump($: EngineInterface, provider: string | undefined, ok: boolea
 
 /** What one request really ran on: the answering model, tokens, the fallback trail. */
 async function record($: EngineInterface, agentId: string | undefined, asked: string, effort: Effort | number | undefined, res: TurnStepResult, trail: string[]) {
-  const u = (res.usage ?? {}) as { model?: string; input_tokens?: number; output_tokens?: number }
+  const u = (res.usage ?? {}) as { model?: string; input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   const real = u.model ?? asked
   const provider = providerOf(await read($, catalogue), asked) ?? providerOf(await read($, catalogue), real)
   const tokens = (u.input_tokens ?? 0) + (u.output_tokens ?? 0)
+  const cr = u.cache_read_input_tokens ?? 0
+  const cw = u.cache_creation_input_tokens ?? 0
   for (const id of trail.slice(0, -1)) await bump($, providerOf(await read($, catalogue), id), false)
   await bump($, provider, res.stopReason !== null)
   if (agentId) {
     await update($, spawns, all => {
       const s = all[agentId]
       if (!s) return all
-      return { ...all, [agentId]: { ...s, real, ...(provider ? { provider } : {}), tokens: s.tokens + tokens, trail: trail.length ? trail : s.trail } }
+      return { ...all, [agentId]: { ...s, real, ...(provider ? { provider } : {}), tokens: s.tokens + tokens, cacheRead: (s.cacheRead ?? 0) + cr, cacheWrite: (s.cacheWrite ?? 0) + cw, trail: trail.length ? trail : s.trail } }
     })
     return
   }
@@ -268,7 +274,7 @@ export const register: Register = on => {
     if (s) {
       const home = (await $.env.get('HOME')) ?? ''
       const path = `${home}/.local/state/model-router/picks.jsonl`
-      const line = JSON.stringify({ at: new Date().toISOString(), type: s.type, description: s.description, model: s.real ?? s.model, effort: s.effort, provider: s.provider, by: s.by, trail: s.trail, tokens: s.tokens, end: (e as { reason?: string }).reason })
+      const line = JSON.stringify(pickRow(s, (e as { reason?: string }).reason, new Date().toISOString()))
       let prev = ''
       try { prev = await $.fs.read(path) } catch {}
       try { await $.fs.write(path, `${prev}${line}\n`) } catch {}

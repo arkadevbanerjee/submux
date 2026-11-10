@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { contextWarning, fromSubmuxProfile, staleLogin, parseArgs, parseCatalogue, resolve, statusText, unknownIds } from '../hooks/route'
+import { canonModel, pickRow, contextWarning, fromSubmuxProfile, staleLogin, parseArgs, parseCatalogue, resolve, statusText, unknownIds } from '../hooks/route'
 import { EMPTY, isRetired, parseCard, parseTag, resolveSpawn, retiredIds, routesInText, sessionSet, spawnLine } from '../hooks/route'
 import type { SpawnIn } from '../hooks/route'
 import type { Routes } from '../types'
@@ -149,4 +149,20 @@ test('stale login: only enabled logins expired over a day', () => {
   expect(staleLogin({ type: 'codex', expired: '2026-10-03T00:00:00+05:30' }, now)).toBe(undefined)
   expect(staleLogin({ type: 'codex', expired: '2026-09-01T00:00:00Z', disabled: true }, now)).toBe(undefined)
   expect(staleLogin({ type: 'codex' }, now)).toBe(undefined)
+})
+
+test('canonModel: one spelling per Claude id, other vendors untouched', () => {
+  expect(canonModel('claude-haiku-5.5')).toBe('claude-haiku-5-5')
+  expect(canonModel('kiro/claude-sonnet-5.5')).toBe('kiro/claude-sonnet-5-5')
+  expect(canonModel('kiro/claude-opus-5.5[1m]')).toBe('kiro/claude-opus-5-5[1m]')
+  expect(canonModel('claude-haiku-5-5')).toBe('claude-haiku-5-5')
+  expect(canonModel('gpt-5.6-sol')).toBe('gpt-5.6-sol')
+  expect(canonModel('grok-4.7-build')).toBe('grok-4.7-build')
+})
+
+test('pickRow: carries id, harness, cache tokens and canonical model', () => {
+  const s = { agentId: 'a1', toolUseId: 't1', type: 'review-agent', description: 'Review PR 1', model: 'claude-haiku-5-5', real: 'claude-haiku-5.5', effort: 'xhigh' as const, by: { model: 'session' as const, effort: 'session' as const }, trail: [], tokens: 100, cacheRead: 2000, cacheWrite: 300, at: 0 }
+  expect(pickRow(s, 'answer', 'T')).toEqual({ at: 'T', id: 'a1', harness: 'claude-code', type: 'review-agent', description: 'Review PR 1', model: 'claude-haiku-5-5', effort: 'xhigh', provider: undefined, by: s.by, trail: [], tokens: 100, cache_read: 2000, cache_write: 300, end: 'answer' })
+  const { cacheRead, cacheWrite, ...old } = s
+  expect(pickRow(old, undefined, 'T')).toMatchObject({ cache_read: 0, cache_write: 0 })
 })

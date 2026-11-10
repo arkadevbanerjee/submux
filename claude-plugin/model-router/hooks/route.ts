@@ -169,6 +169,20 @@ export function spawnLine(s: Spawn, catalogue: readonly Provider[], quota?: Reco
   return parts.filter(Boolean).join(' · ')
 }
 
+/** One spelling per Claude model: `claude-haiku-5.5` and `kiro/claude-haiku-5.5` become `...-5-5`. Other vendors keep their dots. */
+export function canonModel(id: string): string {
+  return /(^|\/)claude-/.test(id) ? id.replace(/-(\d+)\.(\d+)(?=$|[-\[])/g, '-$1-$2') : id
+}
+
+/** One pick-log row: real cost (cache included), the harness, and the agent id that pick-outcome keys on. */
+export function pickRow(s: Spawn, end: string | undefined, at: string): Record<string, unknown> {
+  return {
+    at, id: s.agentId, harness: 'claude-code', type: s.type, description: s.description,
+    model: canonModel(s.real ?? s.model), effort: s.effort, provider: s.provider, by: s.by, trail: s.trail,
+    tokens: s.tokens, cache_read: s.cacheRead ?? 0, cache_write: s.cacheWrite ?? 0, end,
+  }
+}
+
 /** The hint-line tail for one subagent: `grok-4.7-build/med (SuperGrok)`. */
 export function tailLine(s: Spawn, catalogue: readonly Provider[]): string {
   const prov = s.provider ?? providerOf(catalogue, s.real ?? s.model)

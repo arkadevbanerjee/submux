@@ -9,6 +9,8 @@ export type Spawn = {
   agentId: string; toolUseId: string; type: string; description: string
   model: string; effort?: Effort; fallback?: string[]; by: { model: Who; effort: Who }
   real?: string; provider?: string; trail: string[]; tokens: number; at: number
+  /** Prompt-cache tokens read and written, summed over the spawn's requests. */
+  cacheRead?: number; cacheWrite?: number
 }
 /** What one subagent (or main) really ran on, from its last request. */
 export type Seen = { key: string; type: string; description: string; model: string; effort?: string; provider?: string; fellBackFrom?: string; at: number }
