@@ -9,7 +9,7 @@
       "match": "claude-fable-*",
       "upstream": "https://api.anthropic.com",
       "auth": "passthrough",
-      "fallback": ["claude-opus-5", "gpt-5.6-luna", "glm-5.3"],
+      "fallback": ["claude-opus-5-5", "gpt-6.1-sol", "glm-5.3"],
       "subscription": "Claude Max (this CLI's own login)"
     },
     {
