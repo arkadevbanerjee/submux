@@ -479,7 +479,8 @@ export function kiroTarget(url: string, body: unknown): string | undefined {
   if (typeof body !== 'string') return undefined
   let u: URL
   try { u = new URL(url) } catch { return undefined }
-  if (!u.pathname.startsWith('/v1/messages')) return undefined
+  // Direct sessions only: behind a local router (submux) the router owns kiro/* routing.
+  if (u.host !== 'api.anthropic.com' || !u.pathname.startsWith('/v1/messages')) return undefined
   let model: unknown
   try { model = (JSON.parse(body) as { model?: unknown }).model } catch { return undefined }
   if (typeof model !== 'string' || !model.startsWith('kiro/')) return undefined
@@ -504,24 +505,21 @@ export function kiroRewrite(url: string, headers: Record<string, string> | undef
   return { url: base + u.pathname + u.search, headers: out, body: JSON.stringify({ ...parsed, model: target }) }
 }
 
+/** Loopback responder (bin/thread-refuser.py) that answers every POST with Claude Code's `thread_unsupported_request` 400. */
+export const THREAD_REFUSER_PORT = 3460
+export const THREAD_REFUSER = `http://127.0.0.1:${THREAD_REFUSER_PORT}`
+
 /**
- * A direct session sends threaded requests (`thread: create|continue`): a continue carries only the new turn
- * and Anthropic's server fills in the rest. kirocc has no threads, so a continue would reach the model with
- * no task. The answer is a local 400 carrying error_code `thread_unsupported_request`: Claude Code then
- * resends the turn with the full history and keeps that agent and model stateless for the session.
- * Undefined when the request has no `thread`.
+ * True for a request that uses Anthropic's server-side threads (`thread: create|continue`). A continue carries
+ * only the new turn and the server fills in the rest; kirocc has no threads, so the model would get no task.
+ * Such a request goes to THREAD_REFUSER, whose 400 makes Claude Code resend the turn with the full history and
+ * keep that agent and model stateless for the session. A hook-made answer does not work: Claude Code reads it
+ * as a mod refusal and never retries.
  */
-export function kiroThreadRefusal(body: unknown): { status: number; ok: boolean; headers: Record<string, string>; text: string } | undefined {
-  if (typeof body !== 'string') return undefined
-  let thread: unknown
-  try { thread = (JSON.parse(body) as { thread?: unknown }).thread } catch { return undefined }
-  if (thread === undefined || thread === null) return undefined
-  return {
-    status: 400, ok: false,
-    headers: { 'content-type': 'application/json', 'request-id': 'model-router-local' },
-    text: JSON.stringify({
-      type: 'error',
-      error: { type: 'invalid_request_error', message: 'model-router: kirocc has no server-side threads; resend this turn stateless', details: { error_code: 'thread_unsupported_request' } },
-    }),
-  }
+export function isThreaded(body: unknown): boolean {
+  if (typeof body !== 'string') return false
+  try {
+    const t = (JSON.parse(body) as { thread?: unknown }).thread
+    return t !== undefined && t !== null
+  } catch { return false }
 }

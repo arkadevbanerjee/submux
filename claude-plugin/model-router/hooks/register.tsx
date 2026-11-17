@@ -3,7 +3,7 @@ import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'c
 
 import type { Effort, Provider, Routes, Rule, Seen, Slot, Spawn } from '../types'
 import {
-  EFFORTS, EMPTY, SLOTS, contextWarning, kiroRewrite, kiroTarget, kiroThreadRefusal, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
+  EFFORTS, EMPTY, SLOTS, contextWarning, kiroRewrite, kiroTarget, isThreaded, THREAD_REFUSER, THREAD_REFUSER_PORT, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
   modelArgs, parseShort, parseTag, pickRow, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
 } from './route'
 
@@ -235,6 +235,22 @@ async function tick($: EngineInterface) {
 let kiroKey = ''
 let kiroKeyFailed = false
 
+async function refuserAlive($: EngineInterface): Promise<boolean> {
+  try { return (await $.http.fetch(`${THREAD_REFUSER}/health`)).status === 200 } catch { return false }
+}
+
+/** Health-checks the loopback refuser and starts it once if it is down. */
+async function refuserUp($: EngineInterface): Promise<boolean> {
+  if (await refuserAlive($)) return true
+  const script = `${$.plugin.root}/bin/thread-refuser.py`
+  await $.process.run(['sh', '-c', 'nohup python3 -I "$0" "$1" >/dev/null 2>&1 &', script, String(THREAD_REFUSER_PORT)], { timeoutMs: 5000 })
+  for (let i = 0; i < 10; i++) {
+    await $.clock.sleep(200)
+    if (await refuserAlive($)) return true
+  }
+  return false
+}
+
 export const register: Register = on => {
   // Direct sessions (no ANTHROPIC_BASE_URL): an engine request for a `kiro/*` model goes to local kirocc;
   // every other request, main loop and Remote Control included, passes through untouched. The key is read
@@ -244,9 +260,12 @@ export const register: Register = on => {
     const body = e.init?.body
     // Cheap test first, then the real one; the keychain is only touched for a confirmed kiro/* request.
     if (typeof body !== 'string' || !body.includes('"kiro/') || !kiroTarget(e.url, body)) return next(e)
-    // Threaded request: refuse locally so Claude Code resends it with the full history (see kiroThreadRefusal).
-    const refusal = kiroThreadRefusal(body)
-    if (refusal) return { value: refusal }
+    // Threaded request: a real 400 from the loopback refuser makes Claude Code resend it stateless (see
+    // isThreaded). Never forward a threaded request to kirocc: the model would silently lose its context.
+    if (isThreaded(body)) {
+      if (!(await refuserUp($))) return { deny: 'model-router: the thread refuser on 127.0.0.1:3460 is not running, so this kiro/* request cannot be sent without losing its context' }
+      return next({ ...e, url: THREAD_REFUSER + new URL(e.url).pathname, init: { ...e.init, headers: { 'content-type': 'application/json' } } })
+    }
     if (!kiroKey && !kiroKeyFailed) {
       const r = await $.process.run(['security', 'find-generic-password', '-s', 'kiro', '-a', 'KIROCC_API_KEY', '-w'], { timeoutMs: 5000 })
       kiroKey = r.exitCode === 0 ? r.stdout.trim() : ''

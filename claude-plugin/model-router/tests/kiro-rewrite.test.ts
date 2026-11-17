@@ -1,5 +1,5 @@
 import { test, expect } from 'claude-code/testing'
-import { KIROCC, kiroRewrite, kiroTarget, kiroThreadRefusal } from '../hooks/route'
+import { KIROCC, kiroRewrite, kiroTarget, isThreaded } from '../hooks/route'
 
 const A = 'https://api.anthropic.com/v1/messages?beta=true'
 const H = { authorization: '[redacted]', 'x-api-key': '[redacted]', 'anthropic-beta': 'x', 'X-Claude-Code-Session-Id': '[redacted]', 'x-other-secret': '[redacted]' }
@@ -49,15 +49,15 @@ test('main-session body that merely mentions kiro/ is not a kiro request', () =>
   expect(kiroTarget(A, b)).toBeUndefined()
 })
 
-test('threaded kiro request: local 400 Claude Code reads as thread_unsupported_request', () => {
-  const cont = JSON.stringify({ model: 'kiro/claude-haiku-5.5', thread: { type: 'continue', previous_message_id: 'msg_1' }, messages: [] })
-  const r = kiroThreadRefusal(cont)!
-  expect(r.status).toBe(400)
-  expect(JSON.parse(r.text).error.details.error_code).toBe('thread_unsupported_request')
-  expect(kiroThreadRefusal(JSON.stringify({ model: 'kiro/x', thread: { type: 'create' } }))!.status).toBe(400)
+test('isThreaded: create and continue yes, stateless and junk no', () => {
+  expect(isThreaded(JSON.stringify({ model: 'kiro/x', thread: { type: 'continue', previous_message_id: 'm' } }))).toBe(true)
+  expect(isThreaded(JSON.stringify({ model: 'kiro/x', thread: { type: 'create' } }))).toBe(true)
+  expect(isThreaded(body('kiro/x'))).toBe(false)
+  expect(isThreaded('not json')).toBe(false)
+  expect(isThreaded({ base64: 'AA' })).toBe(false)
 })
 
-test('stateless request: no refusal', () => {
-  expect(kiroThreadRefusal(body('kiro/claude-haiku-5.5'))).toBeUndefined()
-  expect(kiroThreadRefusal('not json')).toBeUndefined()
+test('host gate: a session behind a local router is left alone', () => {
+  expect(kiroTarget('http://127.0.0.1:8787/v1/messages', body('kiro/claude-haiku-5.5'))).toBeUndefined()
+  expect(kiroRewrite('http://127.0.0.1:8787/v1/messages', {}, body('kiro/claude-haiku-5.5'), 'K', 's')).toBeUndefined()
 })
