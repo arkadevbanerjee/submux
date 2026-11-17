@@ -236,7 +236,11 @@ let kiroKey = ''
 let kiroKeyFailed = false
 
 async function refuserAlive($: EngineInterface): Promise<boolean> {
-  try { return (await $.http.fetch(`${THREAD_REFUSER}/health`)).status === 200 } catch { return false }
+  // Match the body marker too, so a foreign listener on the port never receives threaded bodies.
+  try {
+    const r = await $.http.fetch(`${THREAD_REFUSER}/health`)
+    return r.status === 200 && r.text.trim() === 'model-router-thread-refuser'
+  } catch { return false }
 }
 
 /** Health-checks the loopback refuser and starts it once if it is down. */
