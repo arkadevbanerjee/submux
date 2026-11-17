@@ -459,3 +459,69 @@ export function parseShort(args: string, cur: Routes, catalogue: readonly Provid
   if (rule.model || rule.effort) agents[rawTarget] = rule; else delete agents[rawTarget]
   return { routes: { ...cur, agents } }
 }
+
+/** The local Kiro proxy. Engine requests for a `kiro/*` model go here; every other request is left alone. */
+export const KIROCC = 'http://127.0.0.1:3456'
+
+export type Outbound = { url: string; headers: Record<string, string>; body: string }
+
+/**
+ * Rewrites one engine model request for a `kiro/*` model to kirocc, or returns undefined to leave it as is.
+ * kirocc wants the bare id (it silently maps an unknown `kiro/...` id to Sonnet), a Bearer key, and an
+ * X-Claude-Code-Session-Id header (400 without one). The Anthropic credential headers are dropped, so the Max login never leaves for kirocc.
+ */
+/**
+ * The kirocc id for an engine model request, or undefined when it is not a `kiro/*` model request.
+ * Same mapping as submux's kiro route: drop `kiro/` and `[1m]`, then `x-5-5` -> `x-5.5`. kirocc answers an
+ * id it does not know with Sonnet, silently, so the id must be exact.
+ */
+export function kiroTarget(url: string, body: unknown): string | undefined {
+  if (typeof body !== 'string') return undefined
+  let u: URL
+  try { u = new URL(url) } catch { return undefined }
+  if (!u.pathname.startsWith('/v1/messages')) return undefined
+  let model: unknown
+  try { model = (JSON.parse(body) as { model?: unknown }).model } catch { return undefined }
+  if (typeof model !== 'string' || !model.startsWith('kiro/')) return undefined
+  const bare = model.slice(5).replace(/\[1m\]$/i, '').replace(/-(\d+)-(\d+)$/, '-$1.$2')
+  return bare || undefined
+}
+
+export function kiroRewrite(url: string, headers: Record<string, string> | undefined, body: unknown, key: string, sessionId: string, base = KIROCC): Outbound | undefined {
+  const target = kiroTarget(url, body)
+  if (!target || !key || typeof body !== 'string') return undefined
+  const u = new URL(url)
+  const parsed = JSON.parse(body) as Record<string, unknown>
+  const out: Record<string, string> = {}
+  // The engine shows credential-like headers as "[redacted]" and does not send their value to another host
+  // (the session id is one of them), so those are dropped and the session id is written fresh.
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (/^(authorization|x-api-key|x-claude-code-session-id)$/i.test(k) || v === '[redacted]') continue
+    out[k] = v
+  }
+  out['authorization'] = `Bearer ${key}`
+  out['x-claude-code-session-id'] = sessionId || 'model-router'
+  return { url: base + u.pathname + u.search, headers: out, body: JSON.stringify({ ...parsed, model: target }) }
+}
+
+/**
+ * A direct session sends threaded requests (`thread: create|continue`): a continue carries only the new turn
+ * and Anthropic's server fills in the rest. kirocc has no threads, so a continue would reach the model with
+ * no task. The answer is a local 400 carrying error_code `thread_unsupported_request`: Claude Code then
+ * resends the turn with the full history and keeps that agent and model stateless for the session.
+ * Undefined when the request has no `thread`.
+ */
+export function kiroThreadRefusal(body: unknown): { status: number; ok: boolean; headers: Record<string, string>; text: string } | undefined {
+  if (typeof body !== 'string') return undefined
+  let thread: unknown
+  try { thread = (JSON.parse(body) as { thread?: unknown }).thread } catch { return undefined }
+  if (thread === undefined || thread === null) return undefined
+  return {
+    status: 400, ok: false,
+    headers: { 'content-type': 'application/json', 'request-id': 'model-router-local' },
+    text: JSON.stringify({
+      type: 'error',
+      error: { type: 'invalid_request_error', message: 'model-router: kirocc has no server-side threads; resend this turn stateless', details: { error_code: 'thread_unsupported_request' } },
+    }),
+  }
+}

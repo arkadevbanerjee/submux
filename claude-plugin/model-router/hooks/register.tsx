@@ -3,7 +3,7 @@ import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'c
 
 import type { Effort, Provider, Routes, Rule, Seen, Slot, Spawn } from '../types'
 import {
-  EFFORTS, EMPTY, SLOTS, contextWarning, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
+  EFFORTS, EMPTY, SLOTS, contextWarning, kiroRewrite, kiroTarget, kiroThreadRefusal, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
   modelArgs, parseShort, parseTag, pickRow, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
 } from './route'
 
@@ -232,7 +232,32 @@ async function tick($: EngineInterface) {
   await syncPicker($)
 }
 
+let kiroKey = ''
+let kiroKeyFailed = false
+
 export const register: Register = on => {
+  // Direct sessions (no ANTHROPIC_BASE_URL): an engine request for a `kiro/*` model goes to local kirocc;
+  // every other request, main loop and Remote Control included, passes through untouched. The key is read
+  // from the keychain at runtime (kiro/KIROCC_API_KEY, the item kirocc itself starts with).
+  on('http.fetch', async ($, e, next) => {
+    if (next.origin.plugin !== 'engine') return next(e)
+    const body = e.init?.body
+    // Cheap test first, then the real one; the keychain is only touched for a confirmed kiro/* request.
+    if (typeof body !== 'string' || !body.includes('"kiro/') || !kiroTarget(e.url, body)) return next(e)
+    // Threaded request: refuse locally so Claude Code resends it with the full history (see kiroThreadRefusal).
+    const refusal = kiroThreadRefusal(body)
+    if (refusal) return { value: refusal }
+    if (!kiroKey && !kiroKeyFailed) {
+      const r = await $.process.run(['security', 'find-generic-password', '-s', 'kiro', '-a', 'KIROCC_API_KEY', '-w'], { timeoutMs: 5000 })
+      kiroKey = r.exitCode === 0 ? r.stdout.trim() : ''
+      kiroKeyFailed = !kiroKey
+      if (kiroKeyFailed) $.ui.toast('model-router: no keychain kiro/KIROCC_API_KEY; kiro/* requests stay unrouted this session')
+    }
+    const out = kiroKey ? kiroRewrite(e.url, e.init?.headers, body, kiroKey, await $.session.id()) : undefined
+    if (!out) return next(e)
+    return next({ ...e, url: out.url, init: { ...e.init, headers: out.headers, body: out.body } })
+  })
+
   on('session.start', async ($, e, next) => {
     void tick($)
     $.clock.every(5000, () => void guardDefaults($))

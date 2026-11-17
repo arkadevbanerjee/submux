@@ -38,6 +38,27 @@ each subagent type with `/model`, with no separate launcher.
 - **Who decides.** The model may set subagent routes only. The main loop, the
   tiers and profiles stay yours.
 
+## Kiro subagents without submux
+
+A session that talks to Anthropic directly (no `ANTHROPIC_BASE_URL`) can still
+run a subagent on a `kiro/*` model, for example `@kiro/claude-haiku-5.5:xhigh`
+in the spawn description. An `http.fetch` hook sends only those model requests
+to kirocc on `127.0.0.1:3456`; the main loop and every other request go to
+Anthropic untouched.
+
+- The id is mapped the way submux maps it: `kiro/` and `[1m]` are dropped and
+  `claude-opus-5-5` becomes `claude-opus-5.5`. kirocc answers an id it does not
+  know with Sonnet, without saying so.
+- The key comes from the keychain item `kiro/KIROCC_API_KEY`, the one kirocc
+  starts with. The Anthropic login headers are never sent to kirocc.
+- Direct sessions use server-side threads: after the first request, Claude Code
+  sends only the new turn. kirocc has no threads, so the hook answers a threaded
+  `kiro/*` request with a local 400 (`thread_unsupported_request`). Claude Code
+  then resends the turn with the full history and keeps that subagent stateless
+  for the session.
+- Needs Claude Code 2.1.321 or later. If an organization's guard loads, only its
+  own mods see engine requests, and this does nothing.
+
 ## Commands
 
 ```
