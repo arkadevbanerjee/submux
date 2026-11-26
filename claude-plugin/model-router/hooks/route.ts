@@ -74,6 +74,21 @@ export function retiredIds(guide: string): string[] {
 }
 
 /**
+ * Ids for the native /model picker: drops Claude Max ids the native rows cover, ids the routing
+ * guide retires (matched without provider prefix or `[1m]`), Sonnet (banned by the cost ladder)
+ * and pre-5 Claude generations.
+ */
+export function pickerIds(ids: readonly string[], retired: readonly string[]): string[] {
+  const dead = new Set(retired)
+  return ids.filter(id => {
+    const bare = id.split('/').pop()!.replace(/\[1m\]$/, '')
+    if (id.startsWith('claude-') && !id.startsWith('claude-gpt')) return false
+    if (dead.has(bare) || /sonnet/.test(bare) || /^claude-(opus|haiku)-4/.test(bare)) return false
+    return true
+  })
+}
+
+/**
  * Routes the user typed in a chat message: `review-agent=gpt-6.1-sol:medium`, `coder=:high`,
  * `sonnet=kiro/claude-sonnet-5.5`. Only names that are a slot or a known agent type,
  * and only ids in the catalogue (or an effort alone), so code like `x=1` never matches.

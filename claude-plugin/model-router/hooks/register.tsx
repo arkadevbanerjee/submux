@@ -4,7 +4,7 @@ import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'c
 import type { Effort, Provider, Routes, Rule, Seen, Slot, Spawn } from '../types'
 import {
   EFFORTS, EMPTY, SLOTS, contextWarning, kiroRewrite, kiroTarget, isThreaded, THREAD_REFUSER, THREAD_REFUSER_PORT, describe, fromSubmuxProfile, isEmpty, isRetired, parseArgs, parseCard, parseCatalogue,
-  modelArgs, parseShort, parseTag, pickRow, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
+  modelArgs, parseShort, parseTag, pickerIds, pickRow, providerOf, providersText, resolve, routesTable, seenLine, spawnLine, resolveSpawn, retiredIds, routesInText, sessionSet, staleLogin, statusText, tailLine, unknownIds,
 } from './route'
 
 const routes = atom({ plugin: 'model-router', key: 'routes' } as const, EMPTY)
@@ -209,10 +209,10 @@ const PICKER_SKIP = new Set(['claude-opus-5', 'claude-sonnet-5', 'gpt-6-sol', 'g
 async function syncPicker($: EngineInterface) {
   const cat = await loadCatalogue($)
   if (!cat.length) return
+  const retired = [...PICKER_SKIP, ...await retired$($)]
   const options = cat.flatMap(p => {
     const tag = p.name.replace(/ \(.*\)/, '').replace('Google AI Pro', 'Antigravity').replace('ChatGPT', 'Codex').replace(' Coding Plan', '')
-    return p.ids
-      .filter(id => !(id.startsWith('claude-') && !id.startsWith('claude-gpt')) && !PICKER_SKIP.has(id.split('/').pop()!))
+    return pickerIds(p.ids, retired)
       .map(id => ({ model: id, label: `${tag} · ${id}`, description: p.name }))
   })
   if (!options.length) return
